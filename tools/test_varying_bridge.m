@@ -19,6 +19,9 @@ int main(int argc, const char **argv) { @autoreleasepool {
     for (NSDictionary *test in cases) {
         NSString *name = test[@"name"];
         unsigned count = [test[@"count"] unsignedIntValue];
+        BOOL gradient = [test[@"gradient"] boolValue];
+        BOOL flat = [name isEqualToString:@"flat"];
+        BOOL linear = [name hasPrefix:@"noperspective"];
         NSString *path = [root stringByAppendingPathComponent:test[@"source"]];
         NSString *src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
         NSError *error = nil;
@@ -36,9 +39,13 @@ int main(int argc, const char **argv) { @autoreleasepool {
         td.storageMode = MTLStorageModeShared; td.usage = MTLTextureUsageRenderTarget;
         id<MTLTexture> target = [d newTextureWithDescriptor:td];
         float values[][4] = {{.5,.25,1,.75}, {NAN,NAN,NAN,NAN}, {INFINITY,INFINITY,INFINITY,INFINITY},
-                            {-INFINITY,-INFINITY,-INFINITY,-INFINITY}, {.5,NAN,INFINITY,1}};
-        for (unsigned k = 0; k < 5; k++) {
-            float data[3][4]; for (unsigned v=0;v<3;v++) memcpy(data[v],values[k],16);
+                            {-INFINITY,-INFINITY,-INFINITY,-INFINITY}, {.5,NAN,INFINITY,1},
+                            {.5,.25,1,.75}, {.5,.25,1,.75}};
+        for (unsigned k = 0; k < 7; k++) {
+            float data[3][4];
+            for (unsigned v=0;v<3;v++) for (unsigned c=0;c<4;c++) data[v][c]=values[k][c]*(gradient?(1u<<v):1);
+            if (k==5) data[1][1]=NAN;
+            if (k==6) data[1][2]=INFINITY;
             id<MTLBuffer> input = [d newBufferWithBytes:data length:sizeof data options:MTLResourceStorageModeShared];
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
             rp.colorAttachments[0].texture=target; rp.colorAttachments[0].loadAction=MTLLoadActionClear;
@@ -52,7 +59,12 @@ int main(int argc, const char **argv) { @autoreleasepool {
             unsigned wrong=0;
             for (unsigned p=0;p<64;p++) for (unsigned c=0;c<4;c++) {
                 float want=values[k][c], got=pixels[p][c];
-                if (![name isEqualToString:@"flat"] && !isfinite(want)) want=NAN;
+                if (gradient && isfinite(want)) {
+                    float x=(float)(p%8)+.5f, y=(float)(p/8)+.5f;
+                    float l1=x/16, l2=(8-y)/16, l0=1-l1-l2;
+                    want*=linear?(l0+2*l1+4*l2):1/(l0+l1/2+l2/4);
+                }
+                if (!flat && (!isfinite(want) || (k==5 && c==1) || (k==6 && c==2))) want=NAN;
                 BOOL equal=isnan(want)?isnan(got):isinf(want)?got==want:fabsf(want-got)<1e-6f;
                 if (!equal) wrong++;
             }
