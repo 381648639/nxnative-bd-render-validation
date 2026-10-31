@@ -1,0 +1,9 @@
+inputs/
+game-input/
+game-runtime/
+visual-evidence/
+*.keys
+*.ipa
+*.xci
+*.nsp
+__pycache__/

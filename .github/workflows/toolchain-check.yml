@@ -1,0 +1,22 @@
+name: Check free standard Mac runner and Metal
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: xcode-27
+    timeout-minutes: 5
+    steps:
+      - name: Check the standard Apple Silicon development environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -m
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          xcrun --sdk macosx metal --version
+          xcrun --sdk iphoneos metal --version

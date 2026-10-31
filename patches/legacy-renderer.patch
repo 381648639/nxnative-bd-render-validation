@@ -1,0 +1,275 @@
+diff --git a/dm/games/0100000011D90000/README.md b/dm/games/0100000011D90000/README.md
+index 997e0ee..6143b0e 100644
+--- a/dm/games/0100000011D90000/README.md
++++ b/dm/games/0100000011D90000/README.md
+@@ -65,3 +65,20 @@ Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform
+ - First battle and later areas remain untested.
+ - User testing on iOS remains required.
+ - Recheck the intermittent Core Audio callback stalls during a long run on the final host build.
++
++## Legacy iOS rendering report
++
++An iPhone 14 (A15), iOS 16.3.1 report on the legacy renderer shows missing
++character faces/bodies and indoor surfaces viewed from underneath, while UI
++remains readable. Static inspection found missing viewport-swizzle replay,
++shared graphics/compute program state, and ignored indirect-dispatch arguments.
++The focused legacy replay regression covers queue/device origins, facing,
++NEGATIVE_Y, interleaved graphics/compute bindings, GPU-written dispatch counts
++and compute driver-bank dimensions. These are shared NVN semantic repairs;
++their causal relationship to every reported game symptom still needs device
++validation. See the legacy replay entries in
++[rendering](../../../docs/reference/rendering.md#legacy-viewport-swizzle-replay).
++
++The iOS profile selects the existing Playback/MixWithOthers audio-session mode
++so Silent Mode does not suppress game audio. It changes session policy, not PCM
++generation; speaker audibility and the full gameplay route remain device checks.
+diff --git a/dm/games/0100000011D90000/ios.env b/dm/games/0100000011D90000/ios.env
+new file mode 100644
+index 0000000..84cd8fa
+--- /dev/null
++++ b/dm/games/0100000011D90000/ios.env
+@@ -0,0 +1,3 @@
++# Keep game audio audible with the iPhone's Silent Mode switch enabled.
++# MixWithOthers preserves audio from other applications.
++DM_AUDIO_SESSION_CATEGORY=playback_mix
+diff --git a/dm/gfx/nvn/nvn_mtl_legacy.inc b/dm/gfx/nvn/nvn_mtl_legacy.inc
+index c1b7b9b..91784b2 100644
+--- a/dm/gfx/nvn/nvn_mtl_legacy.inc
++++ b/dm/gfx/nvn/nvn_mtl_legacy.inc
+@@ -1133,6 +1133,10 @@ static inline void enc_c_end(id e) { m4_end(e); }
+ static inline void enc_c_pso(id e, id<MTLComputePipelineState> p) { [e setComputePipelineState:p]; }
+ static inline void enc_c_args(id e, uint64_t gpu, NSUInteger i) { NSUInteger off; id<MTLBuffer> b = legacy_buffer_at(gpu, &off); if (gpu && !b) MDIE("【红】Unregistered compute argument address"); [e setBuffer:b offset:off atIndex:i]; }
+ static inline void enc_c_dispatch(id e, MTLSize n, MTLSize t) { [e dispatchThreadgroups:n threadsPerThreadgroup:t]; }
++static inline void enc_c_dispatch_indirect(id<MTLComputeCommandEncoder> e, id<MTLBuffer> b, NSUInteger off, MTLSize t) {
++    legacy_use_resource(e, b, MTLResourceUsageRead, 1);
++    [e dispatchThreadgroupsWithIndirectBuffer:b indirectBufferOffset:off threadsPerThreadgroup:t];
++}
+ static inline id enc_b_begin(id cb) { id e = [cb blitCommandEncoder]; legacy_order_begin(e, 3, cb); return e; }
+ static inline void enc_b_end(id e) { m4_end(e); }
+ static inline void enc_b_copy_buffer(id e, id<MTLBuffer> s, NSUInteger so, id<MTLBuffer> d, NSUInteger doff, NSUInteger n) { [e copyFromBuffer:s sourceOffset:so toBuffer:d destinationOffset:doff size:n]; }
+@@ -4229,6 +4233,7 @@ static size_t arena_alloc(size_t n, __strong id<MTLBuffer> *buf) {
+ // ---------- Draw state ----------
+ static struct {
+     const prog_t *prog;
++    const prog_t *cprog;       // Compute and graphics bindings persist independently in NVN.
+     const prog_t *bst[5];      // program bound per stage (NVN stage bits 1 vertex 2 fragment 4 geometry 8 / 16 tessellation, indices as in NvProg.sh), see bind_stages
+     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
+     va_st attr[16]; int nattr; vs_st stream[16]; int nstream;
+@@ -4237,7 +4242,7 @@ static struct {
+     uint64_t tex[6][NTEX], samp[6][128], img[6][32];
+     int samp_base; // descriptor-pool base for sampler IDs read from guest uniforms
+     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
+-    p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp, depth_clamp;
++    p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp, depth_clamp; uint8_t vp_sw[16][4];
+     float blend_color[4]; int64_t copy_stride, copy_img_stride;
+     p_tf_bind tf[4]; uint64_t tf_off[4]; int tf_on, rast_discard;
+ } S;
+@@ -4325,7 +4330,6 @@ static void udc_note_draw(NvProg *pr) {
+ // When every stage comes from the same program, that program is the effective one (all of Mario's and Engage's binds are like this, so nothing changes for them); otherwise a composite is made: a host-made prog_t carrying only a serial, whose NvProg in the serial table takes each stage from its source program (a null fragment = a vertex-only pipeline)
+ static const prog_t *bind_stages(const prog_t *p, int stages) {
+     for (int st = 0; st < 5; st++) if (stages >> st & 1) S.bst[st] = p;
+-    if (stages & 0x20) return p;   // compute: replaced as a whole as before
+     const prog_t *v = S.bst[0];
+     if (!v) return NULL;
+     int same = 1; for (int st = 1; st < 5; st++) if (S.bst[st] && S.bst[st] != v) same = 0;
+@@ -5479,6 +5483,10 @@ static int color_diag_begin(NvShader *sh, int stage) {
+     return 1;
+ }
+ static uint32_t g_dispatch_dim[3];   // the current dispatch's workgroup counts (driver segment c0 + 0x200 for compute)
++// Indirect counts are copied on the GPU before its compute encoder opens. Keep
++// those twelve bytes GPU-owned while the CPU fills the rest of the driver bank.
++static __unsafe_unretained id<MTLBuffer> g_dispatch_driver_buf;
++static size_t g_dispatch_driver_off;
+ static uint32_t g_draw_binst;        // current draw's base instance (driver segment c0 + 0x644)
+ // An indirect draw's base instance is produced on the GPU, so it is not in the
+ // CPU-side p_draw record when encode_args runs.  safe_indirect_encode gives the
+@@ -5797,13 +5805,16 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
+             if (!sh->rf.drv_read[bank]) { slots[aid] = zero_bank_gpu(); USE(zero_bank(), MTLResourceUsageRead); }
+             else {
+                 int gpu_binst = bank == 0 && nvn_stage == 0 && g_indirect_drv0_buf != nil;
++                int gpu_dims = bank == 0 && nvn_stage == 5 && g_dispatch_driver_buf != nil;
+                 id<MTLBuffer> db; size_t doff;
+                 if (gpu_binst) { db = g_indirect_drv0_buf; doff = g_indirect_drv0_off; }
++                else if (gpu_dims) { db = g_dispatch_driver_buf; doff = g_dispatch_driver_off; }
+                 else doff = arena_alloc(DRV_SIZE, &db);
+                 uint8_t *d = (uint8_t *)db.contents + doff;
+                 // A lookahead conversion can already be running after sub_cut.
+                 // Preserve the GPU-owned word while populating this draw's c0.
+                 if (gpu_binst) { memset(d, 0, 0x644); memset(d + 0x648, 0, DRV_SIZE - 0x648); }
++                else if (gpu_dims) { memset(d, 0, 0x200); memset(d + 0x20c, 0, DRV_SIZE - 0x20c); }
+                 else memset(d, 0, DRV_SIZE);
+                 if (bank == 0) {
+                     int base = c0_ssbo_base(nvn_stage);
+@@ -5815,7 +5826,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
+                     // Graphics driver constant: maximum point size (upstream ca7216ceb89c).
+                     if (nvn_stage != 5) { const float max_point = 2047.0f; memcpy(d + 0x610, &max_point, 4); if (!gpu_binst) memcpy(d + 0x644, &g_draw_binst, 4); }
+                     if (nvn_stage == 5) {
+-                        memcpy(d + 0x200, g_dispatch_dim, 12);
++                        if (!gpu_dims) memcpy(d + 0x200, g_dispatch_dim, 12);
+                         for (int r = 0; r < 16; r++) { uint64_t a = S.ubo[5][r].addr; uint32_t n = (uint32_t)S.ubo[5][r].size; memcpy(d + 0x210 + 16 * r, &a, 8); memcpy(d + 0x210 + 16 * r + 8, &n, 4); }
+                     }
+                 } else {
+@@ -5839,7 +5850,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
+                     }
+                     if (sep_bound) { static int once; if (!once++) MLOG("unified NVN driver c2: populated %d separate texture handles for stage %d", sep_bound, nvn_stage); }
+                 }
+-                slots[aid] = gpu_binst ? g_indirect_drv0_gpu : g_cur_arena->gpu + doff;
++                slots[aid] = gpu_binst ? g_indirect_drv0_gpu : legacy_buffer_gpu(db) + doff;
+                 USE(db, MTLResourceUsageRead);
+             }
+         } else RED_ONCE(46, "绑定种类 %d 未实现", b->kind);
+@@ -6061,7 +6072,11 @@ static int first_draw_covers(int i, id<MTLTexture> t, NSUInteger level) {
+     if (vs->rf.pos_w1) for (int k = 0; k < n; k++) P[k][3] = 1.0f;   // Position w is the constant 1 (the attribute's .w is not taken)
+     int sc[4] = {R.sc.x, R.sc.y, R.sc.w, R.sc.h}; float vp[4] = {S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3]};
+     g_fd_why = 11;
+-    return nvn_cover((const float (*)[4])P, n, prim, (int)S.poly.cull, S.poly.front == NVN_FRONT_FACE_CCW,
++    int front_ccw = (S.poly.front == NVN_FRONT_FACE_CCW) ^ g_queue_origin_ll ^ atomic_load_explicit(&g_origin_ll, memory_order_relaxed);
++    uint32_t sw; memcpy(&sw, S.vp_sw[0], 4);
++    if (sw == 0x100) front_ccw ^= 1;
++    else if (sw) return 0;
++    return nvn_cover((const float (*)[4])P, n, prim, (int)S.poly.cull, front_ccw,
+                      S.has_vp, vp, R.has_sc, sc, (long)MAX(t.width >> level, 1), (long)MAX(t.height >> level, 1));
+ }
+ 
+@@ -6073,7 +6088,10 @@ static int state_op(uint32_t op, const void *a) {
+         case OP_SET_SAMP_POOL: { int base = nvn_dpool_base(((const p_set_pool *)a)->pool, 0);
+             if (base != S.samp_base) { S.samp_base = base; args_dirty_all(); } break; }
+         case OP_SCISSOR: R.sc = *(const p_scissor *)a; R.has_sc = 1; break;
+-        case OP_BIND_PROGRAM: { const p_bind_program *bp_ = a; const prog_t *np = bind_stages(bp_->prog, bp_->stages); if (np != S.prog) { S.prog = np; g_pso_dirty = 1; args_dirty_all(); } break; }
++        case OP_BIND_PROGRAM: { const p_bind_program *bp_ = a;
++            if ((bp_->stages & 0x20) && S.cprog != bp_->prog) { S.cprog = bp_->prog; g_args_dirty[5] = 1; }
++            const prog_t *np = bind_stages(bp_->prog, bp_->stages);
++            if (np != S.prog) { S.prog = np; g_pso_dirty = 1; args_dirty_all(); } break; }
+         case OP_BIND_STATE: {
+             const p_bind_state *b = a; void *dst = NULL; size_t n = 0;
+             blend_st bs;
+@@ -6106,6 +6124,7 @@ static int state_op(uint32_t op, const void *a) {
+         case OP_VIEWPORTS: { const p_viewports *b = a; for (int i = 0; i < b->n; i++) memcpy(S.vp[b->first + i], b->v[i], 16); S.has_vp = 1; break; }
+         case OP_DEPTH_RANGE: { const p_depth_range *b = a; S.dr[0] = b->n; S.dr[1] = b->f; break; }
+         case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_depth_clamp *)a)->on; break;
++        case OP_VP_SWIZZLE: { const p_vp_swizzle *b = a; memcpy(S.vp_sw[b->first], b->sw, 4 * (size_t)b->n); break; }
+         case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); break;
+         case OP_COPY_STRIDE: { const p_copy_stride *cs = a; if (cs->image) S.copy_img_stride = cs->stride; else S.copy_stride = cs->stride; break; }
+         case OP_TF_BIND: { const p_tf_bind *b = a; if (b->index >= 0 && b->index < 4) S.tf[b->index] = *b; break; }
+@@ -8042,6 +8061,11 @@ frz_plain:;
+     if (moff != g_ui_moff) { g_ui_moff = moff; g_args_dirty[0] = 1; }
+     { MTLViewport v = S.has_vp ? (MTLViewport){S.vp[0][0], S.vp[0][1] + vo, S.vp[0][2], S.vp[0][3] * vs, S.dr[0], S.dr[1]} : (MTLViewport){0, vo, tw, th * vs, 0, 1};
+       if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { v.originY += v.height; v.height = -v.height; }   // lower-left origin (see g_origin_ll)
++      // NEGATIVE_Y reverses clip Y before facing is evaluated. It flips this
++      // viewport about its centre; the queue's front-face winding stays intact.
++      { uint32_t sw; memcpy(&sw, S.vp_sw[0], 4);
++        if (sw == 0x100) { v.originY += v.height; v.height = -v.height; }
++        else if (sw) RED_ONCE(108, "viewport swizzle %d,%d,%d,%d not implemented (drawn unswizzled)", S.vp_sw[0][0], S.vp_sw[0][1] ^ 2, S.vp_sw[0][2] ^ 4, S.vp_sw[0][3] ^ 6); }
+       if (!(g_ed.ok & ED_VP) || memcmp(&g_ed.vp, &v, sizeof v)) { enc_r_viewport(en, v); g_ed.vp = v; g_ed.ok |= ED_VP; } }
+     MTLScissorRect sc = {0, 0, tw, th};
+     if (R.has_sc) {
+@@ -8296,10 +8320,14 @@ static id<MTLComputePipelineState> compute_pipeline(NvShader *cs, id<MTLFunction
+ }
+ static void dispatch(const p_dispatch *dp) {
+     zskip_clear();
+-    if (!S.prog) { RED_ONCE(27, "compute dispatch has no bound program"); return; }
+-    NvProg *pr = prog_get(S.prog);
++    if (!S.cprog) { RED_ONCE(27, "compute dispatch has no bound program"); return; }
++    NvProg *pr = prog_get(S.cprog);
+     NvShader *cs = pr->sh[5];
+     if (!cs) { RED_ONCE(28, "dispatched program has no mapped compute shader"); return; }
++    void *ib = NULL; uint64_t io = 0;
++    if (dp->ind && !mtl_addr(dp->ind, 12, &ib, &io)) {
++        RED_ONCE(94, "indirect dispatch arguments are in no memory pool: %#llx", (unsigned long long)dp->ind); return;
++    }
+     int min_cs = min_reduction_candidate(cs);
+     id<MTLComputePipelineState> ps = min_cs ? nil : compute_pipeline(cs, cs->fn);
+     if (!min_cs && !ps) return;
+@@ -8316,7 +8344,8 @@ static void dispatch(const p_dispatch *dp) {
+         id<MTLComputeCommandEncoder> ce = pg_compute();
+         enc_c_pso(ce, ps);
+         enc_c_args(ce, legacy_buffer_gpu((__bridge id<MTLBuffer>)ub) + uo, 0); enc_c_args(ce, legacy_buffer_gpu((__bridge id<MTLBuffer>)sb) + so, 1); enc_c_args(ce, legacy_buffer_gpu((__bridge id<MTLBuffer>)db) + dof, 2);   // Built-in compute kernel: cold path, take the addresses directly
+-        enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(32, 1, 1));
++        if (dp->ind) enc_c_dispatch_indirect(ce, (__bridge id<MTLBuffer>)ib, io, MTLSizeMake(32, 1, 1));
++        else enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(32, 1, 1));
+         enc_c_end(ce);
+         pend_add(a1->addr, a1->size ? a1->size : 1);
+         return;
+@@ -8325,12 +8354,19 @@ static void dispatch(const p_dispatch *dp) {
+     gpu_tex_mark_program_images(pr);
+     const uint16_t *tg = cs->rf.tg;
+     if (!tg[0]) { RED_ONCE(29, "计算着色器缺线程组大小反射"); return; }
+-    rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
++    rp_end();
++    g_dispatch_driver_buf = nil;
++    if (dp->ind && cs->rf.drv_read[0]) {
++        id<MTLBuffer> db;
++        g_dispatch_driver_off = arena_alloc(DRV_SIZE, &db); g_dispatch_driver_buf = db;
++        enc_b_copy_buffer(blit(), (__bridge id<MTLBuffer>)ib, io, db, g_dispatch_driver_off + 0x200, 12);
++    }
++    if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+     id<MTLComputeCommandEncoder> ce = pg_compute();
+     if (enc_label_on()) ce.label = [NSString stringWithFormat:@"compute %.16s %dx%dx%d", cs->key, dp->x, dp->y, dp->z];
+     if (!min_cs) enc_c_pso(ce, ps);
+     g_dispatch_dim[0] = (uint32_t)dp->x; g_dispatch_dim[1] = (uint32_t)dp->y; g_dispatch_dim[2] = (uint32_t)dp->z;   // read back by the driver segment c0 (encode_args_)
+-    encode_args(ce, cs, 5, 0);
++    if (!encode_args(ce, cs, 5, 0)) { enc_c_end(ce); return; }
+     if (min_cs) {
+         id<MTLFunction> fn = min_reduction_function(cs) ?: cs->fn;
+         ps = compute_pipeline(cs, fn);
+@@ -8340,8 +8376,13 @@ static void dispatch(const p_dispatch *dp) {
+         if (!ps) { enc_c_end(ce); return; }
+         enc_c_pso(ce, ps);
+     }
+-    enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
++    if (dp->ind) enc_c_dispatch_indirect(ce, (__bridge id<MTLBuffer>)ib, io, MTLSizeMake(tg[0], tg[1], tg[2]));
++    else enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
+     enc_c_end(ce);
++    for (int i = 0; i < cs->rf.nb; i++) if (cs->rf.b[i].kind == NVN_RB_SBUFP && cs->rf.b[i].rw && cs->rf.b[i].reg < 16) {
++        const p_bind_buf *w = &S.ssbo[5][cs->rf.b[i].reg];
++        if (w->addr) pend_add(w->addr, w->size ? w->size : 1);
++    }
+     bright_lut(cs);   // 3D picture brightening: rewrite after the game finishes computing the color lookup table
+ }
+ // GPU: texture -> buffer (row stride taken from SetCopyRowStride, layer stride from SetCopyImageStride, 0 = tightly packed)
+@@ -9186,7 +9227,7 @@ void mtl_exec(const uint8_t *p) {
+             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
+             case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_VBUF1:
+             case OP_BIND_UBO: case OP_BIND_UBO_SMALL: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
+-            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_BLEND_COLOR: case OP_COPY_STRIDE:
++            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_VP_SWIZZLE: case OP_BLEND_COLOR: case OP_COPY_STRIDE:
+                 state_op(h.op, a); break;
+             case OP_TF_BIND: { const p_tf_bind *b = a; PD("Y tf bind %d addr=%#llx size=%llu", b->index, (unsigned long long)b->addr, (unsigned long long)b->size); state_op(h.op, a); break; }
+             case OP_TF_STATE: { const p_tf_state *b = a; static const char *const what[4] = {"begin", "end", "pause", "resume"}; PD("Y tf %s written %llu/%llu/%llu/%llu", what[b->what & 3],
+diff --git a/docs/agents/symptoms.md b/docs/agents/symptoms.md
+index c78d040..d5d7abd 100644
+--- a/docs/agents/symptoms.md
++++ b/docs/agents/symptoms.md
+@@ -446,6 +446,8 @@ One line per symptom in the [subsystem references](../reference/): what you see
+ - A 120 Hz display request and final spatial scaling alone leave a costly 3D scene below 60 rendered frames per second. Interpolating with unrelated or placeholder depth/motion data produces invalid images. → [Experimental image optical-flow presentation](../reference/rendering.md#experimental-image-optical-flow-presentation)
+ - a black scene followed by SIGSEGV in `legacy_use_resource`, immediately after `tex_upgrade_pfv`; iPad logs report address `0x550` or `0x5c8`. → [Legacy format-view copies end a live consumer encoder](../reference/rendering.md#legacy-format-view-copies-end-a-live-consumer-encoder)
+ - Pokemon fullscreen UI extends outside an iPad display, despite a correctly adapted 3D camera. → [Fullscreen HUD extends past a narrow device canvas](../reference/rendering.md#fullscreen-hud-extends-past-a-narrow-device-canvas)
++- flipped scene orientation or reversed facing when a draw uses `NEGATIVE_Y`; UI can use a different viewport state. → [Legacy viewport swizzle replay](../reference/rendering.md#legacy-viewport-swizzle-replay)
++- a compute dispatch is dropped after a graphics program bind, or indirect work executes zero groups. → [Legacy compute bindings and indirect group counts](../reference/rendering.md#legacy-compute-bindings-and-indirect-group-counts)
+ 
+ ## Shaders
+ 
+diff --git a/docs/reference/rendering.md b/docs/reference/rendering.md
+index 29e31d1..3b59449 100644
+--- a/docs/reference/rendering.md
++++ b/docs/reference/rendering.md
+@@ -962,3 +962,19 @@ rejection and stationary HUD strokes over a moving scene on the GPU.
+ - **Fix:** fit the HUD rectangle in both axes. Wider screens retain the width correction; narrower screens retain the full native width and reduce the centered HUD height. The camera still uses the actual screen ratio; the 3D picture fills the display. Keep unrelated menu rectangles and the original guest tables intact.
+ - **Validation:** handheld/docked canvases, 4:3 and 683:512 iPads, ultrawide and native aspect ratios; callback tests retain unrelated saved registers and exact-build guards. User visual evaluation remains required.
+ - **Found on:** [Arceus](../../dm/games/01001F5010DFA000/README.md) and [Z-A](../../dm/games/0100F43008C44000/README.md). Adapted from the author's [aspect/HUD patches](https://github.com/Fl4sh9174/Switch-Emulator-Ultrawide-FPS-Mods), with the narrow-screen case handled separately.
++
++### Legacy viewport swizzle replay
++
++- **Symptom:** flipped scene orientation or reversed facing when a draw uses `NEGATIVE_Y`; UI can use a different viewport state.
++- **Cause:** the recorder emits `OP_VP_SWIZZLE`, but legacy replay neither stores nor applies it. Its coverage proof also omitted queue/device raster-origin differences.
++- **Fix:** preserve per-viewport swizzles, apply the existing shared negative-Y viewport mapping and account for its facing reversal in the coverage proof. Unsupported swizzles are reported and cannot prove full coverage.
++- **Validation:** the focused legacy replay regression reads actual pixels for both queue/device origins, both windings, all cull modes and both Y swizzles. Device gameplay remains a separate check.
++- **Found on:** code review of the [Brilliant Diamond iOS report](../../dm/games/0100000011D90000/README.md#legacy-ios-rendering-report); device causality is pending.
++
++### Legacy compute bindings and indirect group counts
++
++- **Symptom:** a compute dispatch is dropped after a graphics program bind, or indirect work executes zero groups.
++- **Cause:** legacy replay shared one effective program between graphics and compute, and ignored `p_dispatch.ind`, whose direct dimensions are zero. The driver-bank dimensions also need the counts at GPU execution time.
++- **Fix:** retain independent compute state, use Metal's indirect dispatch and copy its counts into the compute driver bank in command-buffer order. The CPU fills the rest of that bank without overwriting those twelve GPU-owned bytes. Track storage writes so later CPU proofs cannot read stale vertices.
++- **Validation:** the focused legacy replay regression interleaves and unbinds graphics programs, queues buffer copies with stale CPU destinations, then checks every compute result and the shader-visible driver dimensions.
++- **Found on:** code review of the [Brilliant Diamond iOS report](../../dm/games/0100000011D90000/README.md#legacy-ios-rendering-report); the contribution of these defects to its missing models is pending device confirmation.
