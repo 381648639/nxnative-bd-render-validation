@@ -11,12 +11,18 @@ assert meta['private'], 'IPA storage must remain private'
 ipa = next(Path('game-input').glob('*.ipa'))
 folder = Path('private-ipa-transfer')
 folder.mkdir(exist_ok=True)
-tag = 'bd-ios-r3-' + os.environ['GITHUB_RUN_ID']
+revision = os.environ.get('IPA_REVISION', 'r3')
+assert revision in ('r3', 'r4')
+verdict = None
+if revision == 'r4':
+    verdict = json.loads(Path('visual-evidence/verdict.json').read_text())
+    assert verdict['verdict'] == 'pass' and verdict['run_id'] == os.environ['GITHUB_RUN_ID']
+tag = 'bd-ios-' + revision + '-' + os.environ['GITHUB_RUN_ID']
 
 def gh(*argv):
     subprocess.run(['gh', *argv, '--repo', repo], check=True, timeout=900)
 
-gh('release', 'create', tag, '--title', 'Private Brilliant Diamond iOS 16 r3 build',
+gh('release', 'create', tag, '--title', 'Private Brilliant Diamond iOS 16 ' + revision + ' build',
    '--notes', 'Unsigned iOS 16.1 package. See provenance and separate gameplay evidence. A completed build is not an iPhone validation.', '--prerelease')
 parts, total = [], hashlib.sha256()
 with ipa.open('rb') as source:
@@ -25,7 +31,7 @@ with ipa.open('rb') as source:
         first = source.read(1024 * 1024)
         if not first:
             break
-        part = folder / f'PokemonBrilliantDiamond-r3.ipa.part-{index:02d}'
+        part = folder / f'PokemonBrilliantDiamond-{revision}.ipa.part-{index:02d}'
         digest = hashlib.sha256()
         with part.open('wb') as destination:
             destination.write(first)
@@ -44,9 +50,10 @@ with ipa.open('rb') as source:
         gh('release', 'upload', tag, str(part))
         index += 1
 manifest = folder / 'ipa-manifest.json'
-manifest.write_text(json.dumps({'title_id': '0100000011D90000', 'version': '1.3.0', 'revision': 'r3',
+manifest.write_text(json.dumps({'title_id': '0100000011D90000', 'version': '1.3.0', 'revision': revision,
                                 'size': ipa.stat().st_size, 'sha256': total.hexdigest(), 'parts': parts,
                                 'source_repository': os.environ['GITHUB_REPOSITORY'],
-                                'source_commit': os.environ['GITHUB_SHA'], 'device_gameplay_verified': False}, indent=2) + '\n')
-gh('release', 'upload', tag, str(manifest), 'build-provenance-r3.json')
+                                'source_commit': os.environ['GITHUB_SHA'], 'device_gameplay_verified': False,
+                                'mac_gameplay_verdict': verdict}, indent=2) + '\n')
+gh('release', 'upload', tag, str(manifest), 'build-provenance-' + revision + '.json')
 print('Unsigned IPA stored privately in', repo, tag, flush=True)

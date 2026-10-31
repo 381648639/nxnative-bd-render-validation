@@ -1,0 +1,140 @@
+diff --git a/dm/gfx/nvn/dmsh_chain.h b/dm/gfx/nvn/dmsh_chain.h
+index 825c62c..8d4064e 100644
+--- a/dm/gfx/nvn/dmsh_chain.h
++++ b/dm/gfx/nvn/dmsh_chain.h
+@@ -1,3 +1,3 @@
+ // Generated file (dm/gfx/tools/dmsh_chain.py --header): the B shader library translation chain version this source tree expects (default options), one for every game;
+ // the host loads only <library dir>/b-<V>/. Run dmsh_chain.py --header after changing the chain's tools and commit this file with the change
+-#define DMSH_CHAIN "ea90ed511690"
++#define DMSH_CHAIN "e11e8a24adce"
+diff --git a/dm/gfx/tools/dmsh_build.py b/dm/gfx/tools/dmsh_build.py
+index f2bd0db..d5c0c48 100644
+--- a/dm/gfx/tools/dmsh_build.py
++++ b/dm/gfx/tools/dmsh_build.py
+@@ -9,7 +9,7 @@
+ # Environment IOSOUT=dir: the same MSL also goes through dm/ios/tools/ios_metal.compile to produce an iphoneos metallib + reflection (chain_metal records the iOS compile convention)
+ # Final summary: success / failure counts and the distribution of reasons; distribution of driver segment read offsets (those outside the range the replay layer can fill are listed separately)
+ import ast, inspect, os, re, sys, json, struct, hashlib, shutil, subprocess, tempfile, collections, threading, concurrent.futures as cf
+-import dmsh_geometry, dmsh_atomic, dmsh_legacy_atomic
++import dmsh_geometry, dmsh_atomic, dmsh_legacy_atomic, dmsh_nonfinite
+ DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # Workspace root (game files, build outputs and run artifacts are all under it)
+ HOME = os.path.expanduser('~')
+ dm_dir, out = sys.argv[1:3]; want = set(sys.argv[3:]); cache_root = out
+@@ -54,7 +54,9 @@ PRE_STATS = collections.Counter()
+ # -O1: the front end's -O2 (CorrelatedValuePropagation, then SimplifyCFG) folds the translated shaders' repeated tests of one value into switches whose cases jump past their own join.
+ # Apple's GPU backend then exceeds its control-flow ID budget ("Max Unstruct ID 758 ... exceeds supported limit", a note, not an error) and falls back to a slower lowering:
+ # Odyssey's alRenderMaterialUber took 25 minutes and 17.3 MB of GPU code, 31 s and 1.3 MB at -O1. Ordinary shaders come out within a few percent either way (the backend optimizes again)
+-MAC_METAL = ['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1', '-fpreserve-invariance']
++# The varying bridge and Maxwell min/max semantics require NaN tests to survive
++# optimization, as on iOS. Relaxed permits reassociation without assuming finiteness.
++MAC_METAL = ['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1', '-fpreserve-invariance', '-fmetal-math-mode=relaxed']
+ MAC_RECORD = ' '.join(MAC_METAL) + '; xcrun -sdk macosx metallib'
+ # The outer shader and fetch-variant caches restore compiled libraries directly,
+ # before the MSL compile cache can check their compiler. Keep override builds separate there too.
+@@ -606,7 +608,7 @@ def unfillable(dr):
+ 
+ RULES = []   # MSL rewrite rules attached by shader name (function, applicability test); the former dark-range remap toe has been removed (back to the original Switch brightness)
+ # The first-stage code fingerprint does not include dmsh_fetch.py; readable-tile variants get a separate second-stage cache keyed on the generated MSL.
+-CODE_FP = hashlib.sha256(source_without_rule_bodies().encode() + b''.join(b'\0' + open(m.__file__, 'rb').read() for m in (dmsh_chain, dmsh_geometry, dmsh_atomic, dmsh_legacy_atomic) + ((ios_metal,) if IOSOUT else ()))).hexdigest()
++CODE_FP = hashlib.sha256(source_without_rule_bodies().encode() + b''.join(b'\0' + open(m.__file__, 'rb').read() for m in (dmsh_chain, dmsh_geometry, dmsh_atomic, dmsh_legacy_atomic, dmsh_nonfinite) + ((ios_metal,) if IOSOUT else ()))).hexdigest()
+ TOOL_FP = tool_fingerprint().encode()
+ 
+ _CAST = ('as_type<int>(', 'as_type<uint>(')
+@@ -906,6 +908,7 @@ def geometry_finish(key, w, j, c1):
+             if r.returncode: return 'geometry reader failed', r.stderr.strip()[:160], None
+             reader = vs_layer(vs_init(dmsh_geometry.reader(precise(dmsh_atomic.check_msl(r.stdout)))))
+             analysis, full = vs_depth(reader)
++            full, _ = dmsh_nonfinite.bridge(full, 'vs')
+             meta = {'key': key + '_bgv', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key,
+                     'stage': 'vs', 'entry': 'main0', 'entry_z': 'main0_z', 'msl_entry_kind': 'vertex',
+                     'geometry_reader': True, 'geometry_output': layout['output'], 'c1': '', 'notes': [], 'drv_reads': {}, 'drv_unfillable': [],
+@@ -952,11 +955,17 @@ def finish(key, w, j, c1):
+     if j['stage'] == 'vs' and PAIRS.get(key):   # outputs the pixel shader reads but the vertex shader does not write get (0,0,0,1) (see vs_pad)
+         src, pad = vs_pad(key, src)
+         if pad: open(msl, 'w').write(src)
++    if j['stage'] == 'ps':
++        src, _ = dmsh_nonfinite.bridge(src, 'ps')
++        open(msl, 'w').write(src)
+     lay = None; discard = False
+     res = json.load(open(os.path.join(w, key + '.res.json')))
+     if j['stage'] == 'vs':   # the two depth-convention entry points (see vs_depth); the analysis below uses the source with only main0
+         capture = dmsh_geometry.capture(src)
+         src, full = vs_depth(src)
++        # Capture and transform feedback keep the original values. Only raster
++        # entry points carry finite data and flags through Metal interpolation.
++        full, _ = dmsh_nonfinite.bridge(full, 'vs')
+         full += capture
+         discard = any(b.get('rw') for b in reflect(key, 'vs', src, res))
+         if discard: full += vs_discard(src)
+diff --git a/dm/gfx/tools/dmsh_chain.py b/dm/gfx/tools/dmsh_chain.py
+index 0ffa1cf..d152fd9 100644
+--- a/dm/gfx/tools/dmsh_chain.py
++++ b/dm/gfx/tools/dmsh_chain.py
+@@ -15,7 +15,7 @@
+ import os, sys, hashlib, subprocess, shutil
+ DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # Workspace root (game files, build outputs and run artifacts are all under it)
+ HERE = os.path.dirname(os.path.abspath(__file__)); GFX = os.path.dirname(HERE); HOME = os.path.expanduser('~')
+-FILES = ['tools/dmsh_chain.py', 'tools/dmsh_build.py', 'tools/dmsh_atomic.py', 'tools/dmsh_legacy_atomic.py', 'tools/dmsh_fetch.py', 'tools/dmsh_vin.py', 'tools/dmsh_pull.py', 'tools/dmsh_pull.metal', 'tools/dmsh_geometry.py', 'tools/dmsh_facts.py', 'tools/dmsh_xlate/Program.cs', 'tools/dmsh_xlate/dmsh_xlate.csproj', '../ios/tools/ios_metal.py', 'tools/dmsh_chain.lock']
++FILES = ['tools/dmsh_chain.py', 'tools/dmsh_build.py', 'tools/dmsh_atomic.py', 'tools/dmsh_legacy_atomic.py', 'tools/dmsh_nonfinite.py', 'tools/dmsh_fetch.py', 'tools/dmsh_vin.py', 'tools/dmsh_pull.py', 'tools/dmsh_pull.metal', 'tools/dmsh_geometry.py', 'tools/dmsh_facts.py', 'tools/dmsh_xlate/Program.cs', 'tools/dmsh_xlate/dmsh_xlate.csproj', '../ios/tools/ios_metal.py', 'tools/dmsh_chain.lock']
+ # This target-specific lowering lives in the vendored translator. Include its
+ # sources as well as the rebuilt DLL fingerprint; no old shader cache can bypass it.
+ FILES += ['../third_party/ryujinx/src/Ryujinx.Graphics.Shader/' + f for f in (
+diff --git a/dm/gfx/tools/dmsh_nonfinite.py b/dm/gfx/tools/dmsh_nonfinite.py
+new file mode 100644
+--- /dev/null
++++ b/dm/gfx/tools/dmsh_nonfinite.py
+@@ -0,0 +1,54 @@
++"""Preserve NVIDIA non-finite floating varyings across Metal interpolation.
++
++NVIDIA's linear interpolation produces NaN for non-finite inputs. The tested
++Metal interpolator instead produces FLT_MAX. Carry finite flags separately so
++the original non-finite result can be reconstructed after interpolation.
++Flat and integer varyings do not use this path.
++"""
++import re
++
++MEMBER = re.compile(r'^\s*(float|half)([234]?)\s+(\w+)\s+\[\[user\(locn(\d+)\)([^\]]*)\]\];', re.M)
++
++def bridge(source, stage):
++    if stage not in ('vs', 'ps'):
++        raise ValueError('Only raster vertex and fragment interfaces are supported')
++    name = 'main0_out' if stage == 'vs' else 'main0_in'
++    body = re.search(r'\bstruct ' + name + r'\s*\{(.*?)\n\};', source, re.S)
++    if not body:
++        return source, []
++    members = [m for m in MEMBER.finditer(body[1]) if 'flat' not in m[5]]
++    if not members:
++        return source, []
++    declarations, statements, locations = [], [], []
++    for m in members:
++        kind, width, field, location, qualifiers = m.groups()
++        ty, mask = kind + width, 'float' + width
++        marker = 'dm_nonfinite_' + location
++        declarations.append(f'    {mask} {marker} [[user(dm_nonfinite_locn{location}){qualifiers}]];')
++        locations.append(int(location))
++        if stage == 'vs':
++            statements.append(f'    out.{marker} = select({mask}(0.0), {mask}(1.0), !isfinite(out.{field}));')
++            statements.append(f'    out.{field} = select(out.{field}, {ty}(0.0), out.{marker} != {mask}(0.0));')
++        else:
++            statements.append(f'    in.{field} = select(in.{field}, {ty}(as_type<float>(0x7fc00000u)), in.{marker} != {mask}(0.0));')
++    source = source[:body.end()-3] + '\n' + '\n'.join(declarations) + source[body.end()-3:]
++    # Insert only in raster entry points returning this exact interface type.
++    if stage == 'vs':
++        entries = list(re.finditer(r'\bvertex\s+main0_out\s+\w+\s*\(', source))
++    else:
++        entries = list(re.finditer(r'\bfragment\s+\w+\s+\w+\(main0_in\s+in\s+\[\[stage_in\]\]', source))
++    for entry in reversed(entries):
++        start = source.index('{', entry.end())
++        if stage == 'ps':
++            source = source[:start+1] + '\n' + '\n'.join(statements) + source[start+1:]
++            continue
++        depth, end = 1, start + 1
++        while depth:
++            depth += (source[end] == '{') - (source[end] == '}')
++            end += 1
++        block = source[start:end]
++        block, count = re.subn(r'\breturn out;', '\n'.join(statements) + '\n    return out;', block)
++        if count != 1:
++            raise ValueError('Raster entry must return its output once')
++        source = source[:start] + block + source[end:]
++    return source, locations

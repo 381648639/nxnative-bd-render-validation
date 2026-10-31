@@ -186,6 +186,19 @@ try:
                         elif 'restart' in step:
                             start_process(step.get('env'))
                             pause(step.get('wait', 25))
+                        elif 'verdict' in step:
+                            verdict = step['verdict']
+                            names = step.get('screenshots', [])
+                            if verdict not in ('pass', 'fail') or not names:
+                                raise ValueError('A visual verdict needs pass/fail and inspected screenshots')
+                            if any(not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', n) or not (shots / (n + '.png')).is_file() for n in names):
+                                raise ValueError('Every inspected screenshot must exist in this session')
+                            record = {'verdict': verdict, 'screenshots': names,
+                                      'source_commit': os.environ['GITHUB_SHA'],
+                                      'run_id': os.environ['GITHUB_RUN_ID'],
+                                      'platform': 'macOS Metal; iPhone is untested'}
+                            (evidence / 'verdict.json').write_text(json.dumps(record, indent=2) + '\n')
+                            upload(evidence / 'verdict.json')
                         elif step.get('stop'):
                             running = False
                     last_id = int(batch['id'])

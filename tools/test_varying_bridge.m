@@ -62,5 +62,5 @@ int main(int argc, const char **argv) { @autoreleasepool {
         }
     }
     printf("Failed checks (including budget diagnostics): %u\n",failed);
-    return 0;
+    return failed ? 1 : 0;
 } }

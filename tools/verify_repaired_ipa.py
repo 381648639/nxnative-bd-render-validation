@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import zipfile
 
 
@@ -26,6 +27,20 @@ def verify(ipa, patches, revision):
         skinning = [n for n in z.namelist() if n.endswith("/2c1e06378edbd813_b.metallib")]
         if len(skinning) != 1:
             raise ValueError("The required Unity skinning kernel is missing or duplicated")
+        chain = None
+        visual = None
+        if revision == 'r4':
+            chain = os.environ['EXPECTED_CHAIN']
+            buckets = {re.search(r'/b-([0-9a-f]+)/', n).group(1) for n in z.namelist()
+                       if n.endswith('.metallib') and re.search(r'/b-([0-9a-f]+)/', n)}
+            if buckets != {chain}:
+                raise ValueError('The IPA contains stale or mixed translation chains')
+            source = z.read('Payload/DmIOS.app/msl/b-' + chain + '/nonpoint-v1/b8b1925cc16f8247_b.metal').decode()
+            if 'dm_nonfinite_1' not in source or '!isfinite(out.m_31)' not in source:
+                raise ValueError('The television vertex shader lacks the non-finite bridge')
+            visual = json.loads(Path('visual-evidence/verdict.json').read_text())
+            if visual['verdict'] != 'pass' or visual['run_id'] != os.environ['GITHUB_RUN_ID']:
+                raise ValueError('This exact production build has no passing Mac visual verdict')
         result = {
             "revision": revision,
             "upstream_sha": os.environ["UPSTREAM_SHA"],
@@ -39,6 +54,8 @@ def verify(ipa, patches, revision):
             "skinning_kernel": skinning[0],
             "ipa_size": Path(ipa).stat().st_size,
             "device_gameplay_verified": False,
+            "shader_chain": chain,
+            "mac_gameplay_verdict": visual,
         }
     return result
 

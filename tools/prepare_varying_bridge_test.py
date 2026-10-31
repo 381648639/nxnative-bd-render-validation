@@ -1,8 +1,13 @@
 """Generate synthetic programs for interpolation and interface-budget checks."""
 import json
+import os
 from pathlib import Path
 import sys
-from visual_nonfinite_varyings import bridge
+if os.environ.get('DM_NONFINITE_TOOLS'):
+    sys.path.insert(0, os.environ['DM_NONFINITE_TOOLS'])
+    from dmsh_nonfinite import bridge
+else:
+    from visual_nonfinite_varyings import bridge
 
 root = Path(sys.argv[1])
 root.mkdir(parents=True, exist_ok=True)
