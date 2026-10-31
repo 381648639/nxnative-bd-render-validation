@@ -1,0 +1,16 @@
+name: Check synthetic floating varying interpolation and limits
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: xcode-27
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python3 tools/prepare_varying_bridge_test.py synthetic-bridge
+      - run: xcrun clang -fobjc-arc -Wall -Wextra -framework Foundation -framework Metal tools/test_varying_bridge.m -o /tmp/test-varying-bridge
+      - run: /tmp/test-varying-bridge synthetic-bridge
