@@ -1,0 +1,198 @@
+name: Build unsigned IPA on the free standard Mac runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_tag:
+        description: Private release tag containing the split base and v393216 update
+        required: true
+        default: bd-inputs-v1
+        type: string
+      package:
+        description: Must remain v393216 (Pokémon Brilliant Diamond 1.3.0)
+        required: true
+        default: v393216
+        type: string
+      gpu:
+        description: Legacy renderer pipeline archive mode; none lets the iPhone build its own
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_SHA: 1942eaa5e2a767809868994c27dfc5d692439fdc
+  PYTHONUTF8: '1'
+  BD_ASSET_REPOSITORY: wanghao940607-oss/nxnative-pokemon-bd-ios-build
+  GH_TOKEN: ${{ secrets.BD_PRIVATE_REPO_TOKEN }}
+
+concurrency:
+  group: bd-ios-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 180
+    steps:
+      - name: Checkout build configuration
+        uses: actions/checkout@v4
+        with:
+          path: build-config
+          persist-credentials: false
+
+      - name: Checkout pinned NxNative source
+        uses: actions/checkout@v4
+        with:
+          repository: seedds/nxnative
+          ref: 1942eaa5e2a767809868994c27dfc5d692439fdc
+          path: nxnative
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the source revision and locked toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C nxnative rev-parse HEAD)" = "$UPSTREAM_SHA"
+          xcodebuild -version
+          test -x "$(xcrun --find metal)"
+          xcrun --sdk macosx metal --version
+          xcrun --sdk iphoneos metal --version
+          grep -F $'metal_macosx\tApple metal version 32023.921 (metalfe-32023.921.6)' nxnative/dm/gfx/tools/dmsh_chain.lock
+          grep -F $'metal_iphoneos\tApple metal version 32023.921 (metalfe-32023.921.6)' nxnative/dm/gfx/tools/dmsh_chain.lock
+
+      - name: Apply validated iOS rendering, diagnostic and audio repairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C nxnative apply --check ../build-config/patches/legacy-renderer.patch
+          git -C nxnative apply ../build-config/patches/legacy-renderer.patch
+          git -C nxnative apply --check ../build-config/patches/legacy-diagnostics.patch
+          git -C nxnative apply ../build-config/patches/legacy-diagnostics.patch
+          git -C nxnative apply --check ../build-config/patches/legacy-prediction.patch
+          git -C nxnative apply ../build-config/patches/legacy-prediction.patch
+          shasum -a 256 build-config/patches/legacy-{renderer,diagnostics,prediction}.patch
+          test -f nxnative/dm/games/0100000011D90000/ios.env
+
+      - name: Download private input release
+        env:
+          GH_TOKEN: ${{ secrets.BD_PRIVATE_REPO_TOKEN }}
+          INPUT_TAG: ${{ inputs.input_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p inputs
+          gh release download "$INPUT_TAG" --repo "$BD_ASSET_REPOSITORY" --pattern 'bd-base-xci.part-*' --dir inputs --clobber
+          gh release download "$INPUT_TAG" --repo "$BD_ASSET_REPOSITORY" --pattern 'bd-update-v393216.part-*' --dir inputs --clobber
+          gh release download "$INPUT_TAG" --repo "$BD_ASSET_REPOSITORY" --pattern 'input-manifest.json' --dir inputs --clobber
+          ls -lh inputs
+
+      - name: Reassemble and verify private game inputs
+        env:
+          INPUT_TAG: ${{ inputs.input_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          m = json.loads(Path('inputs/input-manifest.json').read_text())
+          if m.get('title_id') != '0100000011D90000':
+              raise SystemExit('input manifest title ID is not 0100000011D90000')
+          if m.get('update_version') != 'v393216':
+              raise SystemExit('input manifest is not the required v393216 update')
+          for key in ('base_xci', 'update_nsp'):
+              if not isinstance(m.get(key), dict):
+                  raise SystemExit(f'manifest lacks {key}')
+              for field in ('size', 'sha256'):
+                  if field not in m[key]:
+                      raise SystemExit(f'manifest lacks {key}.{field}')
+          PY
+          BASE_SIZE=$(python3 -c "import json; print(json.load(open('inputs/input-manifest.json'))['base_xci']['size'])")
+          BASE_SHA=$(python3 -c "import json; print(json.load(open('inputs/input-manifest.json'))['base_xci']['sha256'])")
+          UPDATE_SIZE=$(python3 -c "import json; print(json.load(open('inputs/input-manifest.json'))['update_nsp']['size'])")
+          UPDATE_SHA=$(python3 -c "import json; print(json.load(open('inputs/input-manifest.json'))['update_nsp']['sha256'])")
+          python3 build-config/tools/join_parts.py inputs/base.xci 'inputs/bd-base-xci.part-*' "$BASE_SIZE" "$BASE_SHA"
+          python3 build-config/tools/join_parts.py inputs/update.nsp 'inputs/bd-update-v393216.part-*' "$UPDATE_SIZE" "$UPDATE_SHA"
+          mkdir -p game-input
+          mv inputs/base.xci game-input/'Pokemon Brilliant Diamond [0100000011D90000][US][v0].xci'
+          mv inputs/update.nsp game-input/'Pokemon Brilliant Diamond [0100000011D90000][US][v393216].nsp'
+
+      - name: Select Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the pinned Python build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 -m pip install --disable-pip-version-check --no-input 'nsz==5.0.0' 'lz4==4.4.5' 'capstone==5.0.9' 'fonttools==4.68.0' 'backports.zstd==1.8.0'
+          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+          dotnet --version
+          zstd --version
+
+      - name: Write private prod.keys without logging it
+        env:
+          BD_PROD_KEYS: ${{ secrets.BD_PROD_KEYS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$BD_PROD_KEYS"
+          umask 077
+          printf '%s' "$BD_PROD_KEYS" > game-input/prod.keys
+          test -s game-input/prod.keys
+
+      - name: Build unsigned iOS 16.1 IPA from v393216
+        working-directory: nxnative
+        env:
+          PACKAGE: ${{ inputs.package }}
+          GPU: ${{ inputs.gpu }}
+          DM_IOS_RENDERER: legacy
+          # iPhone 14 uses an Apple5+ GPU path; the A10X audit rejects
+          # fragment image writes that are native on this target class.
+          DM_LEGACY_TARGET: m2
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$PACKAGE" = v393216
+          test "$GPU" = none
+          python3 scripts/build_ipa_from_nsp.py ../game-input \
+            --keys ../game-input/prod.keys \
+            --package v393216 \
+            --platform ios \
+            --gpu none \
+            --show-fps \
+            --motion \
+            --progress lines
+
+      - name: Verify IPA provenance and record checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          IPA=$(find game-input -maxdepth 1 -type f -name '*.ipa' -print -quit)
+          test -n "$IPA"
+          test "$(unzip -Z1 "$IPA" | grep -c '^Payload/.*\.app/$')" -eq 1
+          unzip -p "$IPA" Payload/*.app/Info.plist > /tmp/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' /tmp/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /tmp/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' /tmp/Info.plist || true
+          shasum -a 256 "$IPA" | tee "$IPA.sha256"
+          python3 build-config/tools/verify_repaired_ipa.py --revision r3 "$IPA" \
+            build-config/patches/legacy-renderer.patch \
+            build-config/patches/legacy-diagnostics.patch \
+            build-config/patches/legacy-prediction.patch > build-provenance-r3.json
+          cp "$IPA" artifacts-PokemonBrilliantDiamond-v393216-r3.ipa
+          cp "$IPA.sha256" artifacts-PokemonBrilliantDiamond-v393216-r3.ipa.sha256
+
+      - name: Publish the unsigned IPA to private release storage
+        run: python3 build-config/tools/publish_private_ipa.py
+      - name: Keep diagnostic build logs private
+        if: always()
+        run: python3 build-config/tools/preserve_private_evidence.py
