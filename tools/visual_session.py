@@ -162,6 +162,8 @@ try:
                             pause(step['wait'])
                         elif 'passdump' in step:
                             command('passdump ' + str(min(5, int(step['passdump']))))
+                        elif step.get('log'):
+                            upload(log)
                         elif 'texdump' in step:
                             name = step['texdump']
                             if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', name):
