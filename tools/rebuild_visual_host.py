@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 repo, config, runtime, variant = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
-assert variant in ('r2', 'r3', 'modern')
+assert variant in ('r2', 'r3', 'modern', 'nonfinite-probe')
 if variant == 'r2':
     for name in ('legacy-prediction.patch', 'legacy-diagnostics.patch'):
         subprocess.run(['git', '-C', str(repo), 'apply', '-R', str((config / 'patches' / name).resolve())], check=True)

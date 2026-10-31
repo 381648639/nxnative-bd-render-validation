@@ -16,6 +16,7 @@ on:
           - r3
           - r2
           - modern
+          - nonfinite-probe
       save_run:
         description: Optional earlier visual run whose game-save.zip should be restored
         default: ''
@@ -125,6 +126,9 @@ jobs:
         env:
           VARIANT: ${{ inputs.variant }}
         run: python3 build-config/tools/rebuild_visual_host.py nxnative build-config game-runtime "$VARIANT"
+      - name: Prepare a development-only non-finite interpolation control
+        if: inputs.variant == 'nonfinite-probe'
+        run: python3 build-config/tools/probe_nonfinite_varyings.py game-runtime
       - name: Prepare all legacy companions also required by the iOS package
         run: python3 build-config/tools/prepare_visual_resources.py nxnative game-runtime
       - name: Keep reusable runtime assets in private storage only
