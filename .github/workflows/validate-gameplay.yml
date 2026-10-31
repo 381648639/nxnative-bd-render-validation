@@ -50,6 +50,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Restore reusable game assets from private release storage
+        id: runtime
+        run: python3 build-config/tools/private_runtime_cache.py restore
       - name: Check exact source and prepare legacy development host
         shell: bash
         run: |
@@ -63,6 +66,7 @@ jobs:
           done
           python3 build-config/tools/prepare_visual_host.py nxnative
       - name: Download private base game and update
+        if: steps.runtime.outputs.found != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -85,6 +89,7 @@ jobs:
                               pattern, str(m[key]['size']), m[key]['sha256']], check=True)
           PY
       - name: Install locked build dependencies
+        if: steps.runtime.outputs.found != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -92,6 +97,7 @@ jobs:
           dotnet --version
           zstd --version
       - name: Write private keys without logging them
+        if: steps.runtime.outputs.found != 'true'
         env:
           BD_PROD_KEYS: ${{ secrets.BD_PROD_KEYS }}
         shell: bash
@@ -101,6 +107,7 @@ jobs:
           umask 077
           printf '%s' "$BD_PROD_KEYS" > game-input/prod.keys
       - name: Build real 1.3.0 guest game for the legacy Mac host
+        if: steps.runtime.outputs.found != 'true'
         working-directory: nxnative
         shell: bash
         run: |
@@ -110,14 +117,18 @@ jobs:
             --platform mac --gpu none --motion --progress lines
           grep -F -- '-DDM_NVN_LEGACY_RENDERER_TEST=1' ../game-input/*_build/logs/mac_host_command.json
       - name: Stage only runtime assets
+        if: steps.runtime.outputs.found != 'true'
         run: python3 build-config/tools/stage_visual_runtime.py game-input/0100000011D90000_build/visual-runtime.json game-runtime
       - name: Rebuild only the host when reusing assets or comparing r2
-        if: inputs.variant == 'r2'
+        if: steps.runtime.outputs.found == 'true' || inputs.variant == 'r2'
         env:
           VARIANT: ${{ inputs.variant }}
         run: python3 build-config/tools/rebuild_visual_host.py nxnative build-config game-runtime "$VARIANT"
       - name: Prepare all legacy companions also required by the iOS package
         run: python3 build-config/tools/prepare_visual_resources.py nxnative game-runtime
+      - name: Keep reusable runtime assets in private storage only
+        if: steps.runtime.outputs.found != 'true' && inputs.variant == 'r3'
+        run: python3 build-config/tools/private_runtime_cache.py save
       - name: Restore a prior cloud gameplay save for the same scene
         if: inputs.save_run != ''
         env:
