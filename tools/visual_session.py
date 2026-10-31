@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import time
+from collect_visual_sources import collect
 
 parser = argparse.ArgumentParser()
 parser.add_argument('runtime', type=Path)
@@ -30,12 +31,16 @@ ctl = root / 'run/ctl.txt'
 log = evidence / 'game.log'
 for directory in ('run/save', 'run/temp'):
     (root / directory).mkdir(parents=True, exist_ok=True)
+(evidence / 'uniforms').mkdir(exist_ok=True)
 env = dict(os.environ, **manifest['env'])
 for key in ('DM_ROOT', 'DM_ROMFS', 'DM_SAVE', 'DM_TEMP', 'DM_FONT_DIR', 'DM_MSL_DIR', 'DM_NVN_SHMAP'):
     env[key] = str(root / env[key])
 env.update(DM_CTL=str(ctl), DM_WINDOW='1', DM_AUDIO='0', DM_KBD='Lucas',
            DM_TEST_NO_BC='1', DM_NO_BC_ASTC='all', DM_PRESENT_LINK='0',
            DM_BOOTPROF='1', DM_LONGFRAME='0', DM_LANG='en')
+env.update(DM_NVN_PASSDUMP_ALL='1', DM_NVN_SNAPRAW='1',
+           DM_NVN_PIXEL_HISTORY='0.5,0.625;0.5,0.373611;0.390625,0.555556',
+           DM_NVN_CBDUMP=str(evidence / 'uniforms'))
 record = dict(manifest, env={k: v for k, v in env.items() if k.startswith('DM_')},
               run_id=os.environ['GITHUB_RUN_ID'], release=tag,
               visual_verdict='pending human inspection')
@@ -164,6 +169,10 @@ try:
                             command('passdump ' + str(min(5, int(step['passdump']))))
                         elif step.get('log'):
                             upload(log)
+                        elif step.get('diagnostics'):
+                            collect(root, evidence)
+                            archive = Path(shutil.make_archive(str(evidence.parent / 'live-diagnostics'), 'zip', evidence))
+                            upload(archive)
                         elif 'texdump' in step:
                             name = step['texdump']
                             if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', name):
@@ -188,6 +197,7 @@ try:
 finally:
     stop_process()
     publish_status()
+    collect(root, evidence)
     # The actual game saves allow subsequent scene comparisons without replaying
     # the entire introduction. They are uploaded only to this private repository.
     shutil.copytree(root / 'run/save', evidence / 'save', dirs_exist_ok=True)

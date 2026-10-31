@@ -71,4 +71,6 @@ text = text.replace(old, '''void dm_gfx_texdump_next(const char *path) {
     pthread_mutex_unlock(&g_td_live_mu);
 }''')
 legacy.write_text(text)
+import subprocess
+subprocess.run([sys.executable, str(Path(__file__).with_name('instrument_visual_trace.py')), str(repo)], check=True)
 print("Development host will compile legacy replay and export its real game runtime paths")
