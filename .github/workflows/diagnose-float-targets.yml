@@ -1,0 +1,18 @@
+name: Diagnose non-finite conversion in Metal render targets
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: xcode-27
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Compile and run synthetic format diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun clang -fobjc-arc -Wall -Wextra -framework Foundation -framework Metal tools/diagnose_float_targets.m -o /tmp/diagnose-float-targets
+          /tmp/diagnose-float-targets
