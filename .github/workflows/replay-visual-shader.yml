@@ -1,0 +1,36 @@
+name: Inspect captured shader arithmetic privately
+on:
+  workflow_dispatch:
+    inputs:
+      source_run:
+        required: true
+        default: '41215197441'
+        type: string
+permissions:
+  contents: read
+jobs:
+  replay:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.BD_PRIVATE_REPO_TOKEN }}
+      BD_ASSET_REPOSITORY: wanghao940607-oss/nxnative-pokemon-bd-ios-build
+      SOURCE_RUN: ${{ inputs.source_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Fetch captured shader inputs privately
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]]
+          gh release download "bd-visual-$SOURCE_RUN" --repo "$BD_ASSET_REPOSITORY" --pattern live-diagnostics.zip
+          python3 tools/prepare_visual_replay.py live-diagnostics.zip private-replay
+      - name: Compare captured arithmetic and preserve private results
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun clang -fobjc-arc -Wall -Wextra -framework Foundation -framework Metal tools/replay_visual_shader.m -o /tmp/replay-visual-shader
+          /tmp/replay-visual-shader private-replay "shader-arithmetic-$GITHUB_RUN_ID.txt"
+          gh release upload "bd-visual-$SOURCE_RUN" --repo "$BD_ASSET_REPOSITORY" "shader-arithmetic-$GITHUB_RUN_ID.txt" --clobber
