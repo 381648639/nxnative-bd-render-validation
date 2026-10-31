@@ -15,6 +15,7 @@ on:
         options:
           - r3
           - r2
+          - modern
       save_run:
         description: Optional earlier visual run whose game-save.zip should be restored
         default: ''
@@ -120,7 +121,7 @@ jobs:
         if: steps.runtime.outputs.found != 'true'
         run: python3 build-config/tools/stage_visual_runtime.py game-input/0100000011D90000_build/visual-runtime.json game-runtime
       - name: Rebuild only the host when reusing assets or comparing r2
-        if: steps.runtime.outputs.found == 'true' || inputs.variant == 'r2'
+        if: steps.runtime.outputs.found == 'true' || inputs.variant != 'r3'
         env:
           VARIANT: ${{ inputs.variant }}
         run: python3 build-config/tools/rebuild_visual_host.py nxnative build-config game-runtime "$VARIANT"
