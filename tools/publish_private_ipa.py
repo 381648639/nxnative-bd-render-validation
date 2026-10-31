@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 
 repo = os.environ['BD_ASSET_REPOSITORY']
 meta = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + repo]))
@@ -20,7 +21,16 @@ if revision == 'r4':
 tag = 'bd-ios-' + revision + '-' + os.environ['GITHUB_RUN_ID']
 
 def gh(*argv):
-    subprocess.run(['gh', *argv, '--repo', repo], check=True, timeout=900)
+    attempts = 3 if argv[:2] == ('release', 'upload') else 1
+    for attempt in range(attempts):
+        try:
+            subprocess.run(['gh', *argv, '--repo', repo], check=True, timeout=900)
+            return
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            if attempt + 1 == attempts:
+                raise
+            print('Private upload interrupted; retrying the same file', flush=True)
+            time.sleep(3)
 
 gh('release', 'create', tag, '--title', 'Private Brilliant Diamond iOS 16 ' + revision + ' build',
    '--notes', 'Unsigned iOS 16.1 package. See provenance and separate gameplay evidence. A completed build is not an iPhone validation.', '--prerelease')
@@ -47,7 +57,8 @@ with ipa.open('rb') as source:
                 total.update(chunk)
                 remaining -= len(chunk)
         parts.append({'name': part.name, 'size': part.stat().st_size, 'sha256': digest.hexdigest()})
-        gh('release', 'upload', tag, str(part))
+        gh('release', 'upload', tag, str(part), '--clobber')
+        part.unlink()
         index += 1
 manifest = folder / 'ipa-manifest.json'
 manifest.write_text(json.dumps({'title_id': '0100000011D90000', 'version': '1.3.0', 'revision': revision,
@@ -55,5 +66,5 @@ manifest.write_text(json.dumps({'title_id': '0100000011D90000', 'version': '1.3.
                                 'source_repository': os.environ['GITHUB_REPOSITORY'],
                                 'source_commit': os.environ['GITHUB_SHA'], 'device_gameplay_verified': False,
                                 'mac_gameplay_verdict': verdict}, indent=2) + '\n')
-gh('release', 'upload', tag, str(manifest), 'build-provenance-' + revision + '.json')
+gh('release', 'upload', tag, str(manifest), 'build-provenance-' + revision + '.json', '--clobber')
 print('Unsigned IPA stored privately in', repo, tag, flush=True)

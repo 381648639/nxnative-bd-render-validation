@@ -126,6 +126,9 @@ jobs:
           mkdir -p game-input
           mv inputs/base.xci game-input/'Pokemon Brilliant Diamond [0100000011D90000][US][v0].xci'
           mv inputs/update.nsp game-input/'Pokemon Brilliant Diamond [0100000011D90000][US][v393216].nsp'
+          # The verified input files now replace their private transfer parts.
+          rm -f inputs/bd-base-xci.part-* inputs/bd-update-v393216.part-*
+          df -h .
 
       - name: Select Python 3.12
         uses: actions/setup-python@v5
@@ -240,8 +243,8 @@ jobs:
             build-config/patches/legacy-diagnostics.patch \
             build-config/patches/legacy-prediction.patch \
             build-config/patches/nonfinite-varyings.patch > build-provenance-r4.json
-          cp "$IPA" artifacts-PokemonBrilliantDiamond-v393216-r4.ipa
-          cp "$IPA.sha256" artifacts-PokemonBrilliantDiamond-v393216-r4.ipa.sha256
+          # Publish the verified original; a second full IPA wastes runner space.
+          df -h .
 
       - name: Publish the unsigned IPA to private release storage
         run: python3 build-config/tools/publish_private_ipa.py
