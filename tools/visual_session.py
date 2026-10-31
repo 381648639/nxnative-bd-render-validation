@@ -40,6 +40,8 @@ env.update(DM_CTL=str(ctl), DM_WINDOW='1', DM_AUDIO='0', DM_KBD='Lucas',
            DM_BOOTPROF='1', DM_LONGFRAME='0', DM_LANG='en')
 env.update(DM_NVN_PASSDUMP_ALL='1', DM_NVN_SNAPRAW='1',
            DM_NVN_PIXEL_HISTORY='0.5,0.625;0.5,0.373611;0.390625,0.555556',
+           DM_NVN_TRACE_SHADERS='b8b1925cc16f8247_b,bf70b833d622277c_b',
+           DM_NVN_CBDUMP_KEY='b8b1925cc16f8247_b',
            DM_NVN_CBDUMP=str(evidence / 'uniforms'))
 record = dict(manifest, env={k: v for k, v in env.items() if k.startswith('DM_')},
               run_id=os.environ['GITHUB_RUN_ID'], release=tag,

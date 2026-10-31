@@ -19,7 +19,15 @@ def replace_once(old, new):
 
 replace_once('static void pixel_history_begin(MTLRenderPassDescriptor *pd, NSUInteger nc);',
              'static uint64_t g_visual_trace_frame = UINT64_MAX;\n'
+             'static void visual_uniform_flush(void);\n'
              'static void pixel_history_begin(MTLRenderPassDescriptor *pd, NSUInteger nc);')
+replace_once('pixel_history_end(); zskip_commit_clears();',
+             'pixel_history_end(); visual_uniform_flush(); zskip_commit_clears();')
+replace_once('#include "nvn_pixel_history.h"',
+             '#include "nvn_pixel_history.h"\n#include "visual_uniform_trace.h"')
+replace_once('            slots[aid] = gpu;\n            USE((__bridge id<MTLBuffer>)mb, MTLResourceUsageRead);',
+             '            visual_uniform_note(sh, nvn_stage, reg, gpu, u->size);\n'
+             '            slots[aid] = gpu;\n            USE((__bridge id<MTLBuffer>)mb, MTLResourceUsageRead);')
 replace_once('g_td_frame = (long)atomic_load(&g_cur_frame) + 1;',
              'g_td_frame = (long)atomic_load(&g_cur_frame) + 1;\n'
              '        g_visual_trace_frame = (uint64_t)g_td_frame;')
@@ -30,6 +38,7 @@ old = '            if (g_rt_range_pending) { PD("j rt_level_range pass=%llu vc=%
 assert source.count(old) == 2
 source = source.replace(old, '            if (g_pixel_history.active) rp_end(); // Development capture only.\n' + old)
 legacy.write_text(source)
+(repo / 'dm/gfx/nvn/visual_uniform_trace.h').write_text(Path(__file__).with_name('visual_uniform_trace.h').read_text())
 
 header = repo / 'dm/gfx/nvn/nvn_pixel_history.h'
 source = header.read_text()
