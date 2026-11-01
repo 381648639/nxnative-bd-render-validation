@@ -64,7 +64,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          make -C nxnative/dm/gfx/tests GAME=0100000011D90000 CFLAGS="$PACING_FLAGS" t_link_ticks t_thermal t_pace t_fstep t_nvn
+          make -B -C nxnative/dm/gfx/tests GAME=0100000011D90000 CFLAGS="$PACING_FLAGS" t_link_ticks t_thermal t_pace t_fstep t_nvn
           nxnative/dm/gfx/tests/t_link_ticks --target30
           DM_FPS_TARGET=60 nxnative/dm/gfx/tests/t_link_ticks
           DM_FPS_TARGET=0 nxnative/dm/gfx/tests/t_link_ticks
