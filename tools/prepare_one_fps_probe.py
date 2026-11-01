@@ -26,6 +26,7 @@ assert source.count(old) == 1
 source = source.replace(old, old + '''
     // Bounded per-present telemetry, no GPU readback or extra wait.
     static unsigned probe_samples;
+    extern uint64_t mtl_present_count(void);
     if (++probe_samples <= 12000) {
         const char *target_env = getenv("DM_FPS_TARGET");
         const char *probe_env = getenv("DM_TEST_PACING_CAP_NS");
