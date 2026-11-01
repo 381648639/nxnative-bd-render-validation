@@ -1,7 +1,7 @@
 // Full NVN acquire/present loop without a Metal display link. Rendering is an
 // immediate-completion sink: the fastest possible GPU cannot hide a missing
 // host cap. The production swapchain availability and pacer run unchanged.
-// Controlled runs replace only clock/wait APIs. --wall builds use real Mach
+// Controlled runs replace only clock/wait APIs. Wall builds use real Mach
 // time and waits. This does not emulate drawable presentation or game physics.
 #import <Foundation/Foundation.h>
 #include <mach/mach_time.h>
@@ -107,7 +107,10 @@ static void run_case(int textures, int workload, int target, int hz) {
     CHECK(!mtl_link_active(), "the full loop uses no display link");
     CHECK(fps <= limit * 1.01, "the full classic loop respects its target after warmup");
     CHECK(fabs(classic_duration - 1.0 / limit) < 1e-8, "the real present passes the target duration to the renderer");
-    if (workload <= 2) CHECK(fps > limit * 0.85, "fast frames reach the configured cadence");
+    // A shared virtual runner can oversleep under load. Only the controlled
+    // clock establishes throughput; real OS waits check that the cap is not
+    // exceeded and are not a performance benchmark for an iPhone.
+    if (!CLASSIC_WALL_CLOCK && workload <= 2) CHECK(fps > limit * 0.85, "fast frames reach the configured cadence");
 }
 int main(void) { @autoreleasepool {
     setenv("DM_RT", "0", 1); setenv("DM_PRESENT_SNAP", "0", 1);

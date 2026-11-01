@@ -38,10 +38,19 @@ iPhone.
 
 The manual `check-frame-target.yml` workflow verifies the 30 fps choice through
 real NVN acquire calls on both renderers, with controlled display-link ticks
-and the timer fallback. It first reproduces the missing cap on the pinned
+and the timer fallback's period getter. It first reproduces the missing cap on the pinned
 source, then applies `patches/frame-target.patch` and checks 120/60/30 Hz link
 rates, existing pacing, frame-step and thermal behavior. It also compiles the
 changed source for the iOS 16.1 target and compares legacy NVN checks against
 their baseline. [Run 41266611583](https://github.com/381648639/nxnative-bd-render-validation/actions/runs/41266611583)
 passes. This checks the host cap; it does not establish device movement
 correctness or update an existing IPA.
+
+The separate `check-classic-pacing.yml` runs complete acquire/present cycles
+without a display link, retaining r5 production code. An immediate-completion
+render sink exercises host scheduling at its fastest possible rate. It checks
+two to four textures, fixed and varying frame costs, 30/60/original choices,
+and a 120 Hz display override with a controlled 125/3 Mach timebase. A second
+build uses real Mach waits to check the upper bound; shared-runner throughput
+is not an iPhone benchmark. This tests scheduling, not actual drawable order,
+actor positions or high-rate game simulation.
