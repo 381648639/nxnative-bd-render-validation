@@ -1,0 +1,70 @@
+name: Test one fps through the existing legacy game pacing branch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+  GH_TOKEN: ${{ secrets.BD_PRIVATE_REPO_TOKEN }}
+  BD_ASSET_REPOSITORY: wanghao940607-oss/nxnative-pokemon-bd-ios-build
+
+concurrency:
+  group: bd-one-fps-gameplay
+  cancel-in-progress: false
+
+jobs:
+  gameplay:
+    runs-on: xcode-27
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: build-config
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: seedds/nxnative
+          ref: 1942eaa5e2a767809868994c27dfc5d692439fdc
+          path: nxnative
+          persist-credentials: false
+      - name: Restore verified game assets from private storage
+        id: runtime
+        run: python3 build-config/tools/private_runtime_cache.py restore
+      - name: Prepare r5 pacing with an extreme development control
+        shell: bash
+        run: |
+          set -euo pipefail
+          test '${{ steps.runtime.outputs.found }}' = true
+          for patch in legacy-renderer legacy-diagnostics legacy-prediction frame-target frame-target-default; do
+            git -C nxnative apply --check "../build-config/patches/$patch.patch"
+            git -C nxnative apply "../build-config/patches/$patch.patch"
+          done
+          python3 build-config/tools/prepare_visual_host.py nxnative
+          python3 build-config/tools/prepare_one_fps_probe.py nxnative build-config game-runtime
+          python3 build-config/tools/rebuild_visual_host.py nxnative build-config game-runtime nonfinite-probe
+          python3 build-config/tools/probe_nonfinite_varyings.py game-runtime
+          python3 build-config/tools/prepare_visual_resources.py nxnative game-runtime
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path('game-runtime/runtime.json')
+          data = json.loads(p.read_text())
+          data['env'].update(DM_FPS_TARGET='30', DM_PRESENT_HZ='60', DM_PRESENT_LINK='0')
+          data['one_fps_probe'] = json.loads(Path('game-runtime/one-fps-probe.json').read_text())
+          p.write_text(json.dumps(data, indent=2) + '\n')
+          PY
+      - name: Restore the already inspected bedroom save
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release download bd-visual-41199450210 --repo "$BD_ASSET_REPOSITORY" --pattern game-save.zip --output cloud-save.zip
+          mkdir -p game-runtime/run/save
+          unzip -q cloud-save.zip -d game-runtime/run/save
+      - name: Run actual game and measure the one fps control
+        run: python3 build-config/tools/visual_session.py game-runtime visual-evidence --minutes 25
+      - name: Preserve logs and screenshots only in private storage
+        if: always()
+        run: python3 build-config/tools/preserve_private_evidence.py
