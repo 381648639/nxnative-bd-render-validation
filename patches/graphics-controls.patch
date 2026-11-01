@@ -1,0 +1,380 @@
+diff --git a/dm/host/hle_unity.h b/dm/host/hle_unity.h
+new file mode 100644
+--- /dev/null
++++ b/dm/host/hle_unity.h
+@@ -0,0 +1,6 @@
++// Verified Unity engine controls. Unknown builds are left unchanged.
++#pragma once
++void dm_unity_screen_tick(void);
++// Current engine dimensions, not the requested preset or Metal drawable size.
++int dm_unity_screen_size(int *width, int *height);
++void dm_unity_quality_tick(void);
+diff --git a/dm/host/hle_unity_screen.c b/dm/host/hle_unity_screen.c
+--- a/dm/host/hle_unity_screen.c
++++ b/dm/host/hle_unity_screen.c
+@@ -2,6 +2,7 @@
+ // This reduces the game view itself (including its UI), before render targets
+ // are allocated. It does not scale only the final Metal presentation copy.
+ #include "hle.h"
++#include "hle_unity.h"
+ #include <mach/mach.h>
+ 
+ static int screen_read(uint64_t a, void *out, size_t n) {
+@@ -24,6 +25,24 @@
+     { "94ceae325c205c4b9d6f7235552f28fd", 0x4efe760, 0x4aec580,
+       8, 0x68, {1280, 1920}, {720, 1080} },
+ };
++
++int dm_unity_screen_size(int *width, int *height) {
++    for (int k = 0; k < (int)(sizeof unity_screens / sizeof *unity_screens); k++) {
++        const __typeof__(*unity_screens) *s = &unity_screens[k];
++        for (int i = 0; i < g_nmod; i++) {
++            if (strcmp(g_mod[i].name, "main") || strcmp(g_mod[i].build_id, s->build)) continue;
++            uint64_t base = (uint64_t)(uintptr_t)g_mod[i].base, object, vtable;
++            int current[2];
++            if (!screen_read(base + s->root, &object, sizeof object) || !object || (object & 7) ||
++                !screen_read(object, &vtable, sizeof vtable) || vtable != base + s->vtable ||
++                !screen_read(object + s->current, current, sizeof current) ||
++                current[0] < 1 || current[0] > 1920 || current[1] < 1 || current[1] > 1080) return 0;
++            *width = current[0]; *height = current[1];
++            return 1;
++        }
++    }
++    return 0;
++}
+ 
+ void dm_unity_screen_tick(void) {
+     static int modified, reports, invalid_reported;
+diff --git a/dm/host/hle_unity_quality.c b/dm/host/hle_unity_quality.c
+new file mode 100644
+--- /dev/null
++++ b/dm/host/hle_unity_quality.c
+@@ -0,0 +1,58 @@
++// QualitySettings.shadowResolution follows the verified native Unity setter.
++// Lowering its enum leaves scene resolution, geometry, UI and shadows enabled.
++#include "hle.h"
++#include "hle_unity.h"
++#include <mach/mach.h>
++
++static int quality_read(uint64_t at, void *out, size_t size) {
++    vm_size_t got = 0;
++    return at >= 0x1000 && vm_read_overwrite(mach_task_self(), (vm_address_t)at,
++        size, (vm_address_t)out, &got) == KERN_SUCCESS && got == size;
++}
++
++void dm_unity_quality_tick(void) {
++    static uint64_t saved_object, saved_table;
++    static int original[16], applied[16], seen[16], reports;
++    const char *choice = getenv("DM_SHADOW_QUALITY");
++    if (!choice) choice = DM_GAME_SHADOW_QUALITY;
++    int cap = -1;
++    if (!strcmp(choice, "balanced")) cap = 1;
++    else if (!strcmp(choice, "low")) cap = 0;
++    else if (strcmp(choice, "native")) {
++        static int warned;
++        if (!warned++) LOG("[RED] DM_SHADOW_QUALITY: expected native, balanced or low; keeping original quality");
++    }
++    if (cap < 0 && !saved_object) return;
++    for (int i = 0; i < g_nmod; i++) {
++        const module_t *m = &g_mod[i];
++        if (strcmp(m->name, "main") || strcmp(m->build_id, "94ceae325c205c4b9d6f7235552f28fd")) continue;
++        // Native icall +0xddd260 -> +0x464360: Manager(11), data at
++        // object+0x30, current level at +0x4c, stride 0xa8, enum at +0x30.
++        // The setter clamps to 0..3 and only stores that 32-bit field.
++        // Manager(11) is main+0x4f3e088 + 11*8 (+0x57e120).
++        uint64_t base = (uint64_t)(uintptr_t)m->base, object, vtable, table;
++        int level, current;
++        if (!quality_read(base + 0x4f3e0e0, &object, 8) || !object || (object & 7) ||
++            !quality_read(object, &vtable, 8) || vtable < base + 0x2cf7000 || vtable >= base + 0x5070000 ||
++            !quality_read(object + 0x30, &table, 8) || !table || (table & 7) ||
++            !quality_read(object + 0x4c, &level, 4) || level < 0 || level >= 16) return;
++        uint64_t address = table + (uint64_t)level * 0xa8 + 0x30;
++        if (!quality_read(address, &current, 4) || current < 0 || current > 3) return;
++        if (object != saved_object || table != saved_table) {
++            memset(seen, 0, sizeof seen);
++            saved_object = object; saved_table = table;
++        }
++        if (!seen[level] || current != applied[level]) original[level] = current;
++        seen[level] = 1;
++        int want = cap < 0 || original[level] <= cap ? original[level] : cap;
++        applied[level] = current;
++        if (current == want) return;
++        uint32_t *field = (uint32_t *)(uintptr_t)address, expected = current;
++        dm_guest_write_prepare(field, sizeof *field);
++        if (__atomic_compare_exchange_n(field, &expected, (uint32_t)want, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++            applied[level] = want;
++            if (reports++ < 12) LOG("main: Unity shadow quality %s: level %d, enum %d -> %d", choice, level, current, want);
++        }
++        return;
++    }
++}
+diff --git a/dm/host/hle_fpslock.c b/dm/host/hle_fpslock.c
+--- a/dm/host/hle_fpslock.c
++++ b/dm/host/hle_fpslock.c
+@@ -114,6 +114,8 @@
+ void dm_fps_lock_tick(void) {
+     extern void dm_unity_screen_tick(void);
+     dm_unity_screen_tick();
++    extern void dm_unity_quality_tick(void);
++    dm_unity_quality_tick();
+     nfs_fps_tick();
+     static int state = -2, rows[NLOCKS], nrow, nlog[NLOCKS], target; static uint8_t *base; static const char *src;
+     if (state == -1) return;
+diff --git a/dm/host/tests/t_fpslock.c b/dm/host/tests/t_fpslock.c
+--- a/dm/host/tests/t_fpslock.c
++++ b/dm/host/tests/t_fpslock.c
+@@ -11,6 +11,7 @@
+ int g_nmod;
+ static int writes;
+ void dm_unity_screen_tick(void) {}   // exercised separately in t_unity_screen
++void dm_unity_quality_tick(void) {}  // exercised separately in t_unity_quality
+ void dm_guest_write_prepare(void *p, size_t n) { (void)p; assert(n == 4); writes++; }
+ 
+ static void check(int which) {
+diff --git a/dm/host/tests/t_unity_screen.c b/dm/host/tests/t_unity_screen.c
+--- a/dm/host/tests/t_unity_screen.c
++++ b/dm/host/tests/t_unity_screen.c
+@@ -39,6 +39,11 @@
+         const char *bad[] = {"nan", "0.4", "2", "0.75x"};
+         setenv("DM_SCREEN_RESOLUTION", bad[which - 9], 1);
+     }
++    int actual_w = -7, actual_h = -9;
++    int known = dm_unity_screen_size(&actual_w, &actual_h);
++    assert(known == !(which >= 4 && which <= 8));
++    if (known) assert(actual_w == current[0] && actual_h == current[1]);
++    else assert(actual_w == -7 && actual_h == -9);
+     dm_unity_screen_tick();
+     if (which == 0 || which >= 4) {
+         assert(writes == 0 && object[1] == UINT64_MAX);
+@@ -50,6 +55,7 @@
+         // Simulate Unity consuming its request. Steady frames must not request
+         // repeated reallocations, even when the game clears the pending pair.
+         current[0] = w; current[1] = h;
++        assert(dm_unity_screen_size(&actual_w, &actual_h) && actual_w == w && actual_h == h);
+         for (int i = 0; i < 60; i++) dm_unity_screen_tick();
+         assert(writes == 1);
+         object[1] = UINT64_MAX;
+diff --git a/dm/host/tests/t_unity_quality.c b/dm/host/tests/t_unity_quality.c
+new file mode 100644
+--- /dev/null
++++ b/dm/host/tests/t_unity_quality.c
+@@ -0,0 +1,80 @@
++// The real native-field controller: restore, level changes and invalid objects.
++#include "../hle_unity_quality.c"
++#include <assert.h>
++#include <sys/mman.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++static module_t modules[1];
++module_t *g_mod = modules;
++int g_nmod = 1;
++static int writes;
++void dm_guest_write_prepare(void *p, size_t n) { assert(!((uintptr_t)p & 3) && n == 4); writes++; }
++
++static void run_case(int which) {
++    size_t size = 0x5000000;
++    uint8_t *base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    assert(base != MAP_FAILED);
++    uint64_t object[16] = {0};
++    uint32_t levels[16 * 0xa8 / 4];
++    memset(levels, 0x11, sizeof levels);
++    uint32_t *shadow = &levels[0x30 / 4];
++    *shadow = 3;
++    strcpy(g_mod[0].name, "main");
++    strcpy(g_mod[0].build_id, "94ceae325c205c4b9d6f7235552f28fd");
++    g_mod[0].base = base;
++    *(uintptr_t *)(base + 0x4f3e0e0) = (uintptr_t)object;
++    object[0] = (uintptr_t)base + 0x4aec800;
++    object[0x30 / 8] = (uintptr_t)levels;
++    int *level = (int *)((uint8_t *)object + 0x4c);
++    *level = 0;
++    setenv("DM_SHADOW_QUALITY", "balanced", 1);
++    if (which == 0) setenv("DM_SHADOW_QUALITY", "native", 1);
++    if (which == 2) setenv("DM_SHADOW_QUALITY", "low", 1);
++    if (which == 3) *shadow = 0;
++    if (which == 4) g_mod[0].build_id[0] = '0';
++    if (which == 5) object[0] = 0x10000;
++    if (which == 6) *(uintptr_t *)(base + 0x4f3e0e0) = 0;
++    if (which == 7) object[0x30 / 8] = 0x10000;
++    if (which == 8) *level = 16;
++    if (which == 9) *shadow = 4;
++    if (which == 10) setenv("DM_SHADOW_QUALITY", "invalid", 1);
++    dm_unity_quality_tick();
++    if (which == 0 || (which >= 3 && which <= 10)) assert(writes == 0);
++    else {
++        assert(*shadow == (which == 2 ? 0 : 1) && writes == 1);
++        assert(shadow[-1] == 0x11111111 && shadow[1] == 0x11111111);
++        for (int i = 0; i < 60; i++) dm_unity_quality_tick();
++        assert(writes == 1);
++        if (which == 11) {
++            *level = 1;
++            levels[(0xa8 + 0x30) / 4] = 2;
++            dm_unity_quality_tick();
++            assert(levels[(0xa8 + 0x30) / 4] == 1 && writes == 2);
++            setenv("DM_SHADOW_QUALITY", "native", 1);
++            dm_unity_quality_tick();
++            assert(levels[(0xa8 + 0x30) / 4] == 2);
++            *level = 0;
++        }
++        setenv("DM_SHADOW_QUALITY", "native", 1);
++        dm_unity_quality_tick();
++        assert(*shadow == 3);
++        // A new game quality request becomes the original value restored later.
++        *shadow = 2;
++        setenv("DM_SHADOW_QUALITY", "low", 1);
++        dm_unity_quality_tick(); assert(*shadow == 0);
++        setenv("DM_SHADOW_QUALITY", "native", 1);
++        dm_unity_quality_tick(); assert(*shadow == 2);
++    }
++    munmap(base, size);
++}
++
++int main(void) {
++    for (int i = 0; i < 12; i++) {
++        pid_t child = fork(); assert(child >= 0);
++        if (!child) { run_case(i); _exit(0); }
++        int status; assert(waitpid(child, &status, 0) == child);
++        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
++    }
++    puts("Unity shadow quality: native/balanced/low, no increase, level changes, restore, build and pointer guards passed");
++}
+diff --git a/dm/games/game.py b/dm/games/game.py
+--- a/dm/games/game.py
++++ b/dm/games/game.py
+@@ -99,6 +99,8 @@
+     if ft not in ('0', '30', '60'): sys.exit(f'{g.id}: fps_target must be 0, 30 or 60: {ft}')
+     sr = g.get('screen_resolution', 'native')
+     if sr not in ('native', '1280x720', '960x540', '640x360'): sys.exit(f'{g.id}: unsupported screen_resolution: {sr}')
++    sq = g.get('shadow_quality', 'native')
++    if sq not in ('native', 'balanced', 'low'): sys.exit(f'{g.id}: unsupported shadow_quality: {sq}')
+     fh = g.get('fps_hold', 'on')   # whether the frame step may hold a frame longer than the cap's vsyncs when frames come late (hle_nvn.c fstep_tick): on / off
+     if fh not in ('on', 'off'): sys.exit(f'{g.id}: fps_hold must be on or off: {fh}')
+     ps = g.get('present_snap', 'off')   # present snapshots by default (nvn_mtl.m mtl_snap_on; DM_PRESENT_SNAP and the iOS launcher's Frame buffering override it): on / off
+@@ -163,6 +165,7 @@
+          f'#define DM_GAME_ALLOC_BIG_ALIGN {int(aba == "on")}',
+          f'#define DM_GAME_FPS_TARGET {int(ft)}',
+          f'#define DM_GAME_SCREEN_RESOLUTION {q(sr)}',
++         f'#define DM_GAME_SHADOW_QUALITY {q(sq)}',
+          f'#define DM_GAME_FPS_HOLD {int(fh == "on")}',
+          f'#define DM_GAME_PRESENT_SNAP {int(ps == "on")}',
+          f'#define DM_GAME_PSO_MTL4 {int(p4 == "on")}',
+diff --git a/dm/games/settings.tsv b/dm/games/settings.tsv
+--- a/dm/games/settings.tsv
++++ b/dm/games/settings.tsv
+@@ -21,6 +21,7 @@
+ DM_DYNAMIC_RESOLUTION	toggle	-	0	fixups:DYNAMIC_RESOLUTION	Game	Dynamic resolution	Adjusts resolution between 70% and 100% under load. Turn off to keep full resolution for the selected console mode.
+ DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	fixups:RENDER_SCALE	Game	Render scale		level=basic
+ DM_SCREEN_RESOLUTION	choice	native=Original resolution,1280x720=1280 × 720 (720p),960x540=960 × 540 (540p),640x360=640 × 360 (360p)	DM_GAME_SCREEN_RESOLUTION	fixups:UNITY_SCREEN_RESOLUTION	Game	Render resolution	Changes the game view and menus before rendering. Lower resolutions reduce pixel rendering and sharpness. Applies when starting the game.	level=basic
++DM_SHADOW_QUALITY	choice	native=Original quality,balanced=Balanced,low=Low	DM_GAME_SHADOW_QUALITY	fixups:UNITY_GRAPHICS_QUALITY	Game	Shadow precision	Keeps shadows enabled with a smaller shadow map. Lower settings soften shadow edges without lowering scene or menu resolution. Applies when starting the game.	level=basic
+ DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode		level=basic
+ DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling	Uses more GPU time and can increase heat.
+ DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic
+@@ -35,4 +36,4 @@
+ DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first start waits a few minutes for it, once.
+ DM_NVN_ENC_THREAD	toggle	-	1|0	gfxapi:nvn	Performance	Encode thread
+ DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	Hold frames when late
+-DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD
++DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD	Apple statistics show output size. The game overlay also shows the active internal render size for supported games.
+diff --git a/dm/games/0100000011D90000/game.tsv b/dm/games/0100000011D90000/game.tsv
+--- a/dm/games/0100000011D90000/game.tsv
++++ b/dm/games/0100000011D90000/game.tsv
+@@ -40,6 +40,7 @@
+ fps_target	30
+ present_interval	display
+ screen_resolution	960x540
++shadow_quality	balanced
+ 
+ # ---- Shader split ----
+ shader_groups	/Data/=data
+diff --git a/dm/games/0100000011D90000/patches.py b/dm/games/0100000011D90000/patches.py
+--- a/dm/games/0100000011D90000/patches.py
++++ b/dm/games/0100000011D90000/patches.py
+@@ -1,5 +1,5 @@
+ # Host-side Unity screen requests; no guest code cuts are needed.
+ # Native entry points and object layout are verified only for this main build.
+ CAPABILITIES = {
+-    '94ceae325c205c4b9d6f7235552f28fd': ('UNITY_SCREEN_RESOLUTION',),
++    '94ceae325c205c4b9d6f7235552f28fd': ('UNITY_SCREEN_RESOLUTION', 'UNITY_GRAPHICS_QUALITY'),
+ }
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -8,6 +8,7 @@
+ #include <errno.h>
+ #include "front.h"
+ #include "hle.h"
++#include "hle_unity.h"
+ #include "dm.h"
+ #include "haptics_apple.h"
+ #include "DmAudioRetry.h"
+@@ -150,7 +151,8 @@
+     self.game.frame = CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);
+     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
+         CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
+-        self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), (getenv("DM_FRAMEGEN") && !strcmp(getenv("DM_FRAMEGEN"),"opticalflow"))?190:64, 22);
++        BOOL info = self.fps.numberOfLines > 1;
++        self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), info ? 230 : (getenv("DM_FRAMEGEN") && !strcmp(getenv("DM_FRAMEGEN"),"opticalflow"))?190:64, info ? 58 : 22);
+     }
+ }
+ - (void)viewDidAppear:(BOOL)a {
+@@ -276,21 +278,38 @@
+ 
+ static UILabel *front_ios_fps_label(void) {
+     const char *e = getenv("DM_SHOW_FPS");
+-    if (!(e ? atoi(e) != 0 : [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMShowFPS"] boolValue])) return nil;
++    BOOL showFPS = e ? atoi(e) != 0 : [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMShowFPS"] boolValue];
++    BOOL showSize = getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD")) &&
++        (strcmp(DM_GAME_SCREEN_RESOLUTION, "native") || getenv("DM_SCREEN_RESOLUTION"));
++    if (!showFPS && !showSize) return nil;
+     UILabel *l = [UILabel new];
+     l.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold]; l.textColor = UIColor.whiteColor; l.textAlignment = NSTextAlignmentCenter;
++    l.numberOfLines = showSize ? 3 : 1;
+     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45]; l.layer.cornerRadius = 6; l.layer.masksToBounds = YES; l.userInteractionEnabled = NO;
+-    l.text = @"-- fps";
++    l.text = showFPS ? @"-- fps" : @"";
+     __block uint64_t n0 = mtl_present_count(), e0=0,d0=0,r0=0;
+     mtl_framegen_counts(&e0,&d0,&r0); __block double t0 = CACurrentMediaTime();
+     BOOL flow=getenv("DM_FRAMEGEN") && !strcmp(getenv("DM_FRAMEGEN"),"opticalflow");
++    __block NSString *rate = l.text;
+     [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+         (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime();
+         uint64_t engine,shown,real; mtl_framegen_counts(&engine,&shown,&real);
+         if (now-t0<1.5 && now>t0) {
+-            if(flow) l.text=[NSString stringWithFormat:@"渲染 %.0f · 显示 %.0f",(engine-e0)/(now-t0),(shown-d0)/(now-t0)];
+-            else l.text = [NSString stringWithFormat:@"%.0f fps", (n - n0) / (now - t0)];
+-        }
++            if(flow) rate=[NSString stringWithFormat:@"渲染 %.0f · 显示 %.0f",(engine-e0)/(now-t0),(shown-d0)/(now-t0)];
++            else rate = [NSString stringWithFormat:@"%.0f fps", (n - n0) / (now - t0)];
++        }
++        NSMutableArray<NSString *> *lines = [NSMutableArray array];
++        if (showFPS) [lines addObject:rate];
++        if (showSize) {
++            int w, h;
++            // Read the engine's current size, rather than echoing a preset that
++            // may not have been applied yet. Apple's HUD measures the drawable.
++            if (dm_unity_screen_size(&w, &h)) [lines addObject:[NSString stringWithFormat:@"渲染 %d × %d", w, h]];
++            else [lines addObject:@"渲染：加载中"];
++            CGSize size = g_layer.drawableSize;
++            [lines addObject:[NSString stringWithFormat:@"输出 %.0f × %.0f", size.width, size.height]];
++        }
++        l.text = [lines componentsJoinedByString:@"\n"];
+         e0=engine; d0=shown; r0=real;   // a longer span is the time in the background: no reading
+         n0 = n; t0 = now;
+     }];
+diff --git a/dm/ios/Sources/LauncherSettings.swift b/dm/ios/Sources/LauncherSettings.swift
+--- a/dm/ios/Sources/LauncherSettings.swift
++++ b/dm/ios/Sources/LauncherSettings.swift
+@@ -171,6 +171,12 @@
+         "Encode thread": "独立渲染编码线程",
+         "Hold frames when late": "帧延迟时保持当前画面",
+         "Performance HUD": "性能监测面板",
++        "Shadow precision": "阴影精度",
++        "Original quality": "原始画质",
++        "Balanced": "均衡",
++        "Low": "低",
++        "Keeps shadows enabled with a smaller shadow map. Lower settings soften shadow edges without lowering scene or menu resolution. Applies when starting the game.": "保留阴影，使用较小的阴影贴图。降低后阴影边缘更柔和，场景和菜单分辨率不变；启动游戏时生效。",
++        "Apple statistics show output size. The game overlay also shows the active internal render size for supported games.": "Apple 面板显示输出尺寸。支持的游戏会同时在游戏信息中显示实际内部渲染尺寸。",
+         "American English": "英语（美国）",
+         "British English": "英语（英国）",
+         "Japanese": "日语",
