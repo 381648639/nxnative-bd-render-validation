@@ -13,6 +13,15 @@
 #endif
 static uint64_t classic_now = 10000000000ull;
 static uint64_t classic_sleeps;
+static uint64_t classic_wait_errors;
+#if CLASSIC_WALL_CLOCK
+static kern_return_t classic_wait_until(uint64_t deadline) {
+    classic_sleeps++;
+    kern_return_t result = mach_wait_until(deadline);
+    if (result != KERN_SUCCESS) classic_wait_errors++;
+    return result;
+}
+#endif
 #if !CLASSIC_WALL_CLOCK
 static int classic_clock_gettime(clockid_t c, struct timespec *t) {
     (void)c;
@@ -42,8 +51,8 @@ uint64_t mtl_present(const tex_t *, double, const int[4]);
 #if !CLASSIC_WALL_CLOCK
 #define mach_absolute_time classic_absolute_time
 #define mach_timebase_info classic_timebase_info
-#define mach_wait_until classic_wait_until
 #endif
+#define mach_wait_until classic_wait_until
 #define g_ft g_ft_hle
 #include "../nvn/hle_nvn.c"
 #undef g_ft
@@ -105,7 +114,12 @@ static void run_case(int textures, int workload, int target, int hz) {
     printf("classic textures=%d work=%d target=%d hz=%d wall=%d: %.4f fps, drawable=%.6f s\n", textures, workload, target, hz, CLASSIC_WALL_CLOCK, fps, classic_duration);
     CHECK(classic_enqueues - enqueues == (uint64_t)frames, "one renderer enqueue per present");
     CHECK(!mtl_link_active(), "the full loop uses no display link");
-    CHECK(fps <= limit * 1.01, "the full classic loop respects its target after warmup");
+    // At a wall-clock sample boundary the producer may have up to one complete
+    // swapchain of queued frames. A scheduler stall can move that credit across
+    // the boundary even after warmup. Bound frames by elapsed slots plus that
+    // finite credit, instead of requiring a short sample to have exact phase.
+    if (CLASSIC_WALL_CLOCK) CHECK(frames <= (uint64_t)ceil(seconds * limit) + textures, "real classic waits respect elapsed slots plus bounded swapchain credit");
+    else CHECK(fps <= limit * 1.01, "the controlled classic loop respects its target after warmup");
     CHECK(fabs(classic_duration - 1.0 / limit) < 1e-8, "the real present passes the target duration to the renderer");
     // A shared virtual runner can oversleep under load. Only the controlled
     // clock establishes throughput; real OS waits check that the cap is not
@@ -126,6 +140,6 @@ int main(void) { @autoreleasepool {
             run_case(n, 0, 0, 60);
         }
     }
-    printf("classic result: %d checks, %d failed, %llu simulated OS sleeps\n", checks, failed, (unsigned long long)classic_sleeps);
+    printf("classic result: %d checks, %d failed, %llu OS sleeps, %llu wait errors, wall=%d\n", checks, failed, (unsigned long long)classic_sleeps, (unsigned long long)classic_wait_errors, CLASSIC_WALL_CLOCK);
     return failed != 0;
 } }
