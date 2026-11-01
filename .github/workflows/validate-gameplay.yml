@@ -156,9 +156,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          extra=()
-          if [[ "$SESSION_DIAGNOSTICS" == true ]]; then extra+=(--diagnostics); fi
-          python3 build-config/tools/visual_session.py game-runtime visual-evidence --minutes "$SESSION_MINUTES" "${extra[@]}"
+          if [[ "$SESSION_DIAGNOSTICS" == true ]]; then
+            python3 build-config/tools/visual_session.py game-runtime visual-evidence --minutes "$SESSION_MINUTES" --diagnostics
+          else
+            python3 build-config/tools/visual_session.py game-runtime visual-evidence --minutes "$SESSION_MINUTES"
+          fi
       - name: Preserve diagnostics privately
         if: always()
         shell: bash
