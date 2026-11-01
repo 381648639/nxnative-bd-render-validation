@@ -1,0 +1,77 @@
+name: Verify actual 30 fps pacing on both Metal paths
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pacing:
+    runs-on: xcode-27
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        renderer: [legacy, modern]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: build-config
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: seedds/nxnative
+          ref: 1942eaa5e2a767809868994c27dfc5d692439fdc
+          path: nxnative
+          persist-credentials: false
+      - name: Prepare the production renderer and acquire regression
+        env:
+          RENDERER: ${{ matrix.renderer }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for patch in legacy-renderer legacy-diagnostics legacy-prediction; do
+            git -C nxnative apply --check "../build-config/patches/$patch.patch"
+            git -C nxnative apply "../build-config/patches/$patch.patch"
+          done
+          cp build-config/tests/t_link_ticks.m nxnative/dm/gfx/tests/t_link_ticks.m
+          flags='-O1 -g -Wall -Wno-unused-function -I../nvn/include -I../../host/gen/0100000011D90000/'
+          if [ "$RENDERER" = legacy ]; then
+            flags="$flags -DDM_NVN_LEGACY_RENDERER_TEST=1"
+          fi
+          printf 'PACING_FLAGS=%s\n' "$flags" >> "$GITHUB_ENV"
+      - name: Reproduce the missing cap before the repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C nxnative/dm/gfx/tests GAME=0100000011D90000 CFLAGS="$PACING_FLAGS" t_link_ticks
+          set +e
+          nxnative/dm/gfx/tests/t_link_ticks --target30 > "$RUNNER_TEMP/uncapped.txt" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/uncapped.txt"
+          test "$result" -eq 1
+          grep -F 'FAIL: target 30 on a 120 Hz link waits four ticks' "$RUNNER_TEMP/uncapped.txt"
+          grep -F 'FAIL: target 30 has a 33 ms timer fallback at display 60 Hz' "$RUNNER_TEMP/uncapped.txt"
+      - name: Apply the frame target repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C nxnative apply --check ../build-config/patches/frame-target.patch
+          git -C nxnative apply ../build-config/patches/frame-target.patch
+      - name: Check acquire ticks, timer fallback and existing pacing
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C nxnative/dm/gfx/tests GAME=0100000011D90000 CFLAGS="$PACING_FLAGS" t_link_ticks t_thermal t_pace t_fstep t_nvn
+          nxnative/dm/gfx/tests/t_link_ticks --target30
+          DM_FPS_TARGET=60 nxnative/dm/gfx/tests/t_link_ticks
+          DM_FPS_TARGET=0 nxnative/dm/gfx/tests/t_link_ticks
+          nxnative/dm/gfx/tests/t_thermal
+          DM_THERMAL_CAP=0 nxnative/dm/gfx/tests/t_thermal
+          nxnative/dm/gfx/tests/t_pace
+          nxnative/dm/gfx/tests/t_fstep
+          if [ '${{ matrix.renderer }}' = legacy ]; then
+            MTL_DEBUG_LAYER=1 nxnative/dm/gfx/tests/t_nvn
+          fi
