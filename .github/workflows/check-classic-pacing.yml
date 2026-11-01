@@ -1,0 +1,69 @@
+name: Check r5 full classic acquire and present pacing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  classic:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        renderer: [legacy, modern]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: build-config
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: seedds/nxnative
+          ref: 1942eaa5e2a767809868994c27dfc5d692439fdc
+          path: nxnative
+          persist-credentials: false
+      - name: Prepare the unchanged r5 host and no-link regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          for patch in legacy-renderer legacy-diagnostics legacy-prediction nonfinite-varyings frame-target frame-target-default; do
+            git -C nxnative apply --check "../build-config/patches/$patch.patch"
+            git -C nxnative apply "../build-config/patches/$patch.patch"
+          done
+          cp build-config/tests/t_classic_pacing.m nxnative/dm/gfx/tests/t_classic_pacing.m
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('nxnative/dm/gfx/tests/Makefile')
+          p.write_text(p.read_text() + '''
+          t_classic_pacing: t_classic_pacing.m $(MTL_T_DEP)
+          \tclang $(CFLAGS) -fobjc-arc -o $@ t_classic_pacing.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+          t_classic_pacing_wall: t_classic_pacing.m $(MTL_T_DEP)
+          \tclang $(CFLAGS) -DCLASSIC_WALL_CLOCK=1 -fobjc-arc -o $@ t_classic_pacing.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+          ''')
+          PY
+      - name: Exercise complete classic cycles with controlled and real Mach waits
+        env:
+          RENDERER: ${{ matrix.renderer }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags='-O1 -g -Wall -Wno-unused-function -I../nvn/include -I../../host/gen/0100000011D90000/'
+          if [ "$RENDERER" = legacy ]; then flags="$flags -DDM_NVN_LEGACY_RENDERER_TEST=1"; fi
+          make -C nxnative/dm/gfx/tests GAME=0100000011D90000 CFLAGS="$flags" t_classic_pacing t_classic_pacing_wall
+          for test in t_classic_pacing t_classic_pacing_wall; do
+            if ! nxnative/dm/gfx/tests/"$test" > "$RUNNER_TEMP/$test.log" 2>&1; then
+              tail -100 "$RUNNER_TEMP/$test.log"
+              exit 1
+            fi
+            grep '^classic' "$RUNNER_TEMP/$test.log"
+          done
+      - name: Preserve public code-only regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: classic-pacing-${{ matrix.renderer }}
+          path: ${{ runner.temp }}/t_classic_pacing*.log
+          retention-days: 7
