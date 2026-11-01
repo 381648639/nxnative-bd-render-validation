@@ -44,6 +44,7 @@ static int test_pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mu
 }
 // Ticks per wait over 50 waits of the given kind (frames that take no time: each wait is the whole frame)
 static double per_wait(int own, int n) {
+    own ? mtl_link_wait_ticks(n, 100000000ull) : mtl_link_wait_tick(n, 100000000ull);
     uint64_t t0 = g_link_tick_n;
     for (int i = 0; i < 50; i++) own ? mtl_link_wait_ticks(n, 100000000ull) : mtl_link_wait_tick(n, 100000000ull);
     return (g_link_tick_n - t0) / 50.0;
