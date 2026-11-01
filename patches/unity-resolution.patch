@@ -148,7 +148,7 @@ new file mode 100644
 +        dm_unity_screen_tick(); assert(writes == 1);
 +        // A later native-size request is scaled again, without changing the
 +        // fullscreen/refresh fields or progressively multiplying the old size.
-+        object[1] = 1280 | (uint64_t)720 << 32;
++        object[1] = (mode ? 1920 : 1280) | (uint64_t)(mode ? 1080 : 720) << 32;
 +        dm_unity_screen_tick(); assert(writes == 2);
 +        assert((uint32_t)object[1] == (uint32_t)w);
 +        setenv("DM_SCREEN_RESOLUTION", "native", 1);
