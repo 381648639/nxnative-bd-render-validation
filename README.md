@@ -19,3 +19,19 @@ local key file. Neither is included in this repository.
 Compile and GPU regression results alone do not establish gameplay correctness.
 Inspect actual characters, indoor and outdoor scenes and save reloads. Mac
 captures do not replace a final A15/iPhone check.
+
+For movement comparisons, leave the workflow's `diagnostics` input off. Load a
+save through the title screen and inspect a screenshot of the intended room
+before sending movement. A `burst` step queues adjacent presented frames and
+uploads their ZIP only after capture, for example:
+
+```json
+{"burst":"room-left-60", "key":"LLeft", "hold":2, "count":16, "stride":1, "lead":2}
+```
+
+Capture logs record actual present numbers and timestamps. PNG readbacks wait
+for the GPU, so these bursts reveal image ordering but do not measure normal
+frame pacing. Restarts record their effective environment in private
+`launches.json`; load and inspect the room again after each restart. A low
+frame rate on a virtual runner cannot validate high frame rate physics on an
+iPhone.

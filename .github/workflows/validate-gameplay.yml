@@ -21,6 +21,10 @@ on:
         description: Optional earlier visual run whose game-save.zip should be restored
         default: ''
         type: string
+      diagnostics:
+        description: Enable detailed shader diagnostics (off for movement comparison)
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -148,10 +152,13 @@ jobs:
       - name: Run real guest game with interactive input and screenshots
         env:
           SESSION_MINUTES: ${{ inputs.minutes }}
+          SESSION_DIAGNOSTICS: ${{ inputs.diagnostics }}
         shell: bash
         run: |
           set -euo pipefail
-          python3 build-config/tools/visual_session.py game-runtime visual-evidence --minutes "$SESSION_MINUTES"
+          extra=()
+          if [[ "$SESSION_DIAGNOSTICS" == true ]]; then extra+=(--diagnostics); fi
+          python3 build-config/tools/visual_session.py game-runtime visual-evidence --minutes "$SESSION_MINUTES" "${extra[@]}"
       - name: Preserve diagnostics privately
         if: always()
         shell: bash

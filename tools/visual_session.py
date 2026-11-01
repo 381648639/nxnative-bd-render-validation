@@ -2,7 +2,7 @@
 """Drive real guest gameplay through DM_CTL and publish small private captures.
 
 The control release accepts an ordered commands.json array of batches. Each batch
-has a unique increasing id and steps containing key/hold/wait, shot, passdump,
+has a unique increasing id and steps containing key/hold/wait, shot, burst, passdump,
 texdump, restart (optional env), or stop. No shell commands are accepted.
 """
 import argparse
@@ -19,6 +19,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('runtime', type=Path)
 parser.add_argument('evidence', type=Path)
 parser.add_argument('--minutes', type=int, default=75)
+parser.add_argument('--diagnostics', action='store_true', help='Enable shader and pixel tracing')
 args = parser.parse_args()
 root, evidence = args.runtime.resolve(), args.evidence.resolve()
 evidence.mkdir(parents=True, exist_ok=True)
@@ -38,11 +39,15 @@ for key in ('DM_ROOT', 'DM_ROMFS', 'DM_SAVE', 'DM_TEMP', 'DM_FONT_DIR', 'DM_MSL_
 env.update(DM_CTL=str(ctl), DM_WINDOW='1', DM_AUDIO='0', DM_KBD='Lucas',
            DM_TEST_NO_BC='1', DM_NO_BC_ASTC='all', DM_PRESENT_LINK='0',
            DM_BOOTPROF='1', DM_LONGFRAME='0', DM_LANG='en')
-env.update(DM_NVN_PASSDUMP_ALL='1', DM_NVN_SNAPRAW='1',
-           DM_NVN_PIXEL_HISTORY='0.5,0.625;0.5,0.373611;0.390625,0.555556',
-           DM_NVN_TRACE_SHADERS='b8b1925cc16f8247_b,bf70b833d622277c_b',
-           DM_NVN_CBDUMP_KEY='b8b1925cc16f8247_b',
-           DM_NVN_CBDUMP=str(evidence / 'uniforms'))
+for key in ('DM_NVN_PASSDUMP_ALL', 'DM_NVN_SNAPRAW', 'DM_NVN_PIXEL_HISTORY',
+            'DM_NVN_TRACE_SHADERS', 'DM_NVN_CBDUMP_KEY', 'DM_NVN_CBDUMP'):
+    env.pop(key, None)
+if args.diagnostics:
+    env.update(DM_NVN_PASSDUMP_ALL='1', DM_NVN_SNAPRAW='1',
+               DM_NVN_PIXEL_HISTORY='0.5,0.625;0.5,0.373611;0.390625,0.555556',
+               DM_NVN_TRACE_SHADERS='b8b1925cc16f8247_b,bf70b833d622277c_b',
+               DM_NVN_CBDUMP_KEY='b8b1925cc16f8247_b',
+               DM_NVN_CBDUMP=str(evidence / 'uniforms'))
 record = dict(manifest, env={k: v for k, v in env.items() if k.startswith('DM_')},
               run_id=os.environ['GITHUB_RUN_ID'], release=tag,
               visual_verdict='pending human inspection')
@@ -59,6 +64,7 @@ process = None
 stream = None
 last_id = 0
 events = []
+launches = []
 began = time.monotonic()
 running = True
 
@@ -88,6 +94,11 @@ def start_process(extra=None):
     process = subprocess.Popen([str(root / manifest['host']), str(root / manifest['patched'])],
                                cwd=root / 'run', env=actual, stdout=stream,
                                stderr=subprocess.STDOUT)
+    launches.append({'elapsed': round(time.monotonic() - began, 3),
+                     'pid': process.pid,
+                     'env': {k: v for k, v in actual.items() if k.startswith('DM_')}})
+    (evidence / 'launches.json').write_text(json.dumps(launches, indent=2) + '\n')
+    upload(evidence / 'launches.json')
     print('Started real guest game, pid', process.pid, flush=True)
 
 def command(text):
@@ -136,6 +147,51 @@ def publish_status():
     (evidence / 'events.json').write_text(json.dumps(events, indent=2) + '\n')
     upload(evidence / 'events.json')
 
+def capture_burst(step):
+    name = step['burst']
+    if not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}', name):
+        raise ValueError('Invalid burst name')
+    key = step.get('key', '')
+    if key and not re.fullmatch(r'[A-Za-z0-9+./-]{1,100}', key):
+        raise ValueError('Invalid burst key')
+    count, stride, lead = (int(step.get(k, d)) for k, d in
+                           [('count', 24), ('stride', 1), ('lead', 2)])
+    if not (1 <= count <= 48 and 1 <= stride <= 60 and 1 <= lead <= 600):
+        raise ValueError('Invalid burst frame schedule')
+    hold = float(step.get('hold', 4))
+    if not 0 <= hold <= 30:
+        raise ValueError('Burst hold must be between 0 and 30 seconds')
+    folder = evidence / 'bursts' / name
+    folder.mkdir(parents=True, exist_ok=False)
+    prefix = folder / 'frame'
+    # Queue all captures before pressing the key: DM_CTL key holds block its
+    # input thread. Network uploads begin after the entire burst completes.
+    began_burst = time.monotonic()
+    command(f'shotburst {count} {stride} {lead} {prefix}')
+    if key:
+        command(key + '~' + str(hold))
+    until = began_burst + 120
+    paths = [folder / f'frame-{i:03d}.png' for i in range(count)]
+    previous = None
+    while time.monotonic() < until and process.poll() is None:
+        sizes = [p.stat().st_size if p.exists() else 0 for p in paths]
+        if all(s > 100 for s in sizes) and sizes == previous and time.monotonic() - began_burst >= hold:
+            break
+        previous = sizes
+        time.sleep(0.3)
+    meta = {'step': step, 'elapsed': round(time.monotonic() - began, 3),
+            'duration': round(time.monotonic() - began_burst, 3),
+            'completed': [p.name for p in paths if p.exists() and p.stat().st_size > 100],
+            'limitation': 'PNG readbacks wait for the GPU and affect frame timing; this is not a performance test.'}
+    (folder / 'capture.json').write_text(json.dumps(meta, indent=2) + '\n')
+    archive = Path(shutil.make_archive(str(folder), 'zip', folder))
+    upload(archive)
+    complete = [p for p in paths if p.exists() and p.stat().st_size > 100]
+    if complete:
+        shutil.copyfile(complete[-1], evidence / 'latest.png')
+        upload(evidence / 'latest.png')
+    print('Captured burst', name, len(complete), 'of', count, flush=True)
+
 try:
     start_process()
     upload(evidence / 'conditions.json')
@@ -158,7 +214,9 @@ try:
                         continue
                     for step in batch['steps']:
                         events.append({'batch': batch['id'], 'elapsed': round(time.monotonic() - began, 2), 'step': step})
-                        if 'key' in step:
+                        if 'burst' in step:
+                            capture_burst(step)
+                        elif 'key' in step:
                             if not re.fullmatch(r'[A-Za-z0-9+./-]{1,100}', step['key']):
                                 raise ValueError('Invalid key specification')
                             command(step['key'] + '~' + str(float(step.get('hold', 0.2))))
