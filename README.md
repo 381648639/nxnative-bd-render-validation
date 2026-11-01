@@ -35,3 +35,13 @@ frame pacing. Restarts record their effective environment in private
 `launches.json`; load and inspect the room again after each restart. A low
 frame rate on a virtual runner cannot validate high frame rate physics on an
 iPhone.
+
+The manual `check-frame-target.yml` workflow verifies the 30 fps choice through
+real NVN acquire calls on both renderers, with controlled display-link ticks
+and the timer fallback. It first reproduces the missing cap on the pinned
+source, then applies `patches/frame-target.patch` and checks 120/60/30 Hz link
+rates, existing pacing, frame-step and thermal behavior. It also compiles the
+changed source for the iOS 16.1 target and compares legacy NVN checks against
+their baseline. [Run 41266611583](https://github.com/381648639/nxnative-bd-render-validation/actions/runs/41266611583)
+passes. This checks the host cap; it does not establish device movement
+correctness or update an existing IPA.

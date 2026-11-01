@@ -13,9 +13,9 @@ ipa = next(Path('game-input').glob('*.ipa'))
 folder = Path('private-ipa-transfer')
 folder.mkdir(exist_ok=True)
 revision = os.environ.get('IPA_REVISION', 'r3')
-assert revision in ('r3', 'r4')
+assert revision in ('r3', 'r4', 'r5')
 verdict = None
-if revision == 'r4':
+if revision in ('r4', 'r5'):
     verdict = json.loads(Path('visual-evidence/verdict.json').read_text())
     assert verdict['verdict'] == 'pass' and verdict['run_id'] == os.environ['GITHUB_RUN_ID']
 tag = 'bd-ios-' + revision + '-' + os.environ['GITHUB_RUN_ID']

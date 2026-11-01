@@ -29,7 +29,7 @@ def verify(ipa, patches, revision):
             raise ValueError("The required Unity skinning kernel is missing or duplicated")
         chain = None
         visual = None
-        if revision == 'r4':
+        if revision in ('r4', 'r5'):
             chain = os.environ['EXPECTED_CHAIN']
             buckets = {re.search(r'/b-([0-9a-f]+)/', n).group(1) for n in z.namelist()
                        if n.endswith('.metallib') and re.search(r'/b-([0-9a-f]+)/', n)}
@@ -41,6 +41,16 @@ def verify(ipa, patches, revision):
             visual = json.loads(Path('visual-evidence/verdict.json').read_text())
             if visual['verdict'] != 'pass' or visual['run_id'] != os.environ['GITHUB_RUN_ID']:
                 raise ValueError('This exact production build has no passing Mac visual verdict')
+        if revision == 'r5':
+            launcher = json.loads(z.read('Payload/DmIOS.app/dm/launcher.json'))
+            target = next(s for s in launcher['settings'] if s['env'] == 'DM_FPS_TARGET')
+            if target['default'] != '30':
+                raise ValueError('The new package must default to 30 fps')
+            marker = b'presentation target 30 fps: at least two 60 Hz vsyncs per frame'
+            if marker not in z.read('Payload/DmIOS.app/DmIOS'):
+                raise ValueError('The rebuilt executable does not contain the presentation cap')
+            if 'DM_FPS_TARGET' in values or 'DM_PRESENT_INTERVAL' in values:
+                raise ValueError('The cap must be compiled in, not supplied by a bundled env override')
         result = {
             "revision": revision,
             "upstream_sha": os.environ["UPSTREAM_SHA"],
@@ -56,6 +66,7 @@ def verify(ipa, patches, revision):
             "device_gameplay_verified": False,
             "shader_chain": chain,
             "mac_gameplay_verdict": visual,
+            "default_fps": '30' if revision == 'r5' else None,
         }
     return result
 

@@ -1,0 +1,17 @@
+diff --git a/dm/games/0100000011D90000/game.tsv b/dm/games/0100000011D90000/game.tsv
+index 8a8d814..379b87c 100644
+--- a/dm/games/0100000011D90000/game.tsv
++++ b/dm/games/0100000011D90000/game.tsv
+@@ -32,9 +32,9 @@ app_pool	0x80000000
+ sys_resource	0x1000000
+ 
+ # ---- Frame rate ----
+-# Unity sets Application.targetFrameRate to 30 when entering the field. The build-gated engine limiter raises it; display pacing also ignores the game's interval 2.
+-# DM_FPS_TARGET=30 DM_PRESENT_INTERVAL=game restores the original rate.
+-fps_target	60
++# Keep the original 30 fps target by default. NVN also paces this choice when
++# display mode ignores Unity's interval 2; an engine field alone is insufficient.
++fps_target	30
+ present_interval	display
+ 
+ # ---- Shader split ----
