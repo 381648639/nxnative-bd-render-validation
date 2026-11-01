@@ -54,6 +54,17 @@ jobs:
           test "$result" -eq 1
           grep -F 'FAIL: target 30 on a 120 Hz link waits four ticks' "$RUNNER_TEMP/uncapped.txt"
           grep -F 'FAIL: target 30 has a 33 ms timer fallback at display 60 Hz' "$RUNNER_TEMP/uncapped.txt"
+      - name: Record the existing legacy NVN compatibility baseline
+        if: matrix.renderer == 'legacy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C nxnative/dm/gfx/tests GAME=0100000011D90000 CFLAGS="$PACING_FLAGS" t_nvn
+          set +e
+          MTL_DEBUG_LAYER=1 nxnative/dm/gfx/tests/t_nvn > "$RUNNER_TEMP/nvn-before.txt" 2>&1
+          result=$?
+          set -e
+          test "$result" -le 1
       - name: Apply the frame target repair
         shell: bash
         run: |
@@ -73,5 +84,31 @@ jobs:
           nxnative/dm/gfx/tests/t_pace
           nxnative/dm/gfx/tests/t_fstep
           if [ '${{ matrix.renderer }}' = legacy ]; then
-            MTL_DEBUG_LAYER=1 nxnative/dm/gfx/tests/t_nvn
+            set +e
+            MTL_DEBUG_LAYER=1 nxnative/dm/gfx/tests/t_nvn > "$RUNNER_TEMP/nvn-after.txt" 2>&1
+            result=$?
+            set -e
+            test "$result" -le 1
+            python3 - <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          def failures(name):
+              return {line.strip() for line in (root / name).read_text().splitlines() if '\u2717' in line}
+          before, after = failures('nvn-before.txt'), failures('nvn-after.txt')
+          for line in sorted(before):
+              print('Existing baseline failure:', line)
+          assert after <= before, 'New NVN failures: ' + repr(after - before)
+          assert '== 159 checks,' in (root / 'nvn-after.txt').read_text()
+          print(f'Legacy NVN: {len(before)} baseline failures, {len(after)} candidate failures, no new failures')
+          PY
           fi
+      - name: Compile the changed pacing source for iOS 16.1
+        if: matrix.renderer == 'legacy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.1 \
+            -std=gnu11 -O1 -g -Wall -Wno-unused-function \
+            -I nxnative/dm/gfx/nvn/include -I nxnative/dm/host/gen/0100000011D90000 \
+            -c nxnative/dm/gfx/nvn/hle_nvn.c -o "$RUNNER_TEMP/hle-nvn-ios16.o"
