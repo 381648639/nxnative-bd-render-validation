@@ -1,0 +1,255 @@
+diff --git a/dm/host/hle_unity_screen.c b/dm/host/hle_unity_screen.c
+new file mode 100644
+--- /dev/null
++++ b/dm/host/hle_unity_screen.c
+@@ -0,0 +1,70 @@
++// Unity's native Screen.SetResolution request, for verified engine builds.
++// This reduces the game view itself (including its UI), before render targets
++// are allocated. It does not scale only the final Metal presentation copy.
++#include "hle.h"
++#include <mach/mach.h>
++
++static int screen_read(uint64_t a, void *out, size_t n) {
++    vm_size_t got = 0;
++    return a >= 0x1000 && vm_read_overwrite(mach_task_self(), (vm_address_t)a,
++        n, (vm_address_t)out, &got) == KERN_SUCCESS && got == n;
++}
++
++static const struct {
++    const char *build;
++    uint64_t root, vtable;
++    uint32_t request, current;
++    int width[2], height[2];   // handheld, docked
++} unity_screens[] = {
++    // Brilliant Diamond 1.3.0, Unity 2019.4.27f1. Screen's icall registration
++    // at +0xe36b54 resolves to +0xdd8930, then ScreenManager vtable +0x10:
++    // +0x4652d4 stores the width/height pair at object+8. Unity applies the
++    // request through its normal resize path (+0x2c2898); current extents are
++    // object+0x68/+0x6c. The constructor installs vtable +0x4aec580.
++    { "94ceae325c205c4b9d6f7235552f28fd", 0x4efe760, 0x4aec580,
++      8, 0x68, {1280, 1920}, {720, 1080} },
++};
++
++void dm_unity_screen_tick(void) {
++    static int modified, reports, invalid_reported;
++    const char *resolution = getenv("DM_SCREEN_RESOLUTION");
++    if (!resolution) resolution = DM_GAME_SCREEN_RESOLUTION;
++    int width = 0, height = 0;
++    if (!strcmp(resolution, "1280x720")) { width = 1280; height = 720; }
++    else if (!strcmp(resolution, "960x540")) { width = 960; height = 540; }
++    else if (!strcmp(resolution, "640x360")) { width = 640; height = 360; }
++    else if (strcmp(resolution, "native")) {
++        if (!invalid_reported++) LOG("[RED] DM_SCREEN_RESOLUTION: expected native, 1280x720, 960x540 or 640x360; using the game's original resolution");
++    }
++    int selected = width != 0;
++    if (!selected && !modified) return;   // bit-exact original behavior
++    for (int k = 0; k < (int)(sizeof unity_screens / sizeof *unity_screens); k++) {
++        const __typeof__(*unity_screens) *s = &unity_screens[k];
++        for (int i = 0; i < g_nmod; i++) {
++            if (strcmp(g_mod[i].name, "main") || strcmp(g_mod[i].build_id, s->build)) continue;
++            uint64_t base = (uint64_t)(uintptr_t)g_mod[i].base, object, vtable, pending;
++            int current[2];
++            if (!screen_read(base + s->root, &object, sizeof object) || !object || (object & 7) ||
++                !screen_read(object, &vtable, sizeof vtable) || vtable != base + s->vtable ||
++                !screen_read(object + s->current, current, sizeof current) ||
++                !screen_read(object + s->request, &pending, sizeof pending)) return;
++            if (current[0] < 1 || current[0] > 1920 || current[1] < 1 || current[1] > 1080) return;
++            int mode = dm_opmode() == 1;
++            if (!selected) { width = s->width[mode]; height = s->height[mode]; }
++            uint64_t want = (uint32_t)width | (uint64_t)(uint32_t)height << 32;
++            if (pending == want) return;
++            int32_t pw = (int32_t)pending, ph = (int32_t)(pending >> 32);
++            if ((pw != -1 && (pw < 1 || pw > 1920)) || (ph != -1 && (ph < 1 || ph > 1080))) return;
++            if (current[0] == width && current[1] == height && pw == -1 && ph == -1) return;
++            uint64_t *p = (uint64_t *)(uintptr_t)(object + s->request);
++            dm_guest_write_prepare(p, sizeof *p);
++            // A single aligned pair preserves width/height together. Do not
++            // overwrite a different request that the game wrote since our read.
++            if (__atomic_compare_exchange_n(p, &pending, want, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++                modified = selected;
++                if (reports++ < 12) LOG("main: Unity screen resolution request %dx%d (%s); current %dx%d", width, height, mode ? "docked" : "handheld", current[0], current[1]);
++            }
++            return;
++        }
++    }
++}
+diff --git a/dm/host/hle_fpslock.c b/dm/host/hle_fpslock.c
+--- a/dm/host/hle_fpslock.c
++++ b/dm/host/hle_fpslock.c
+@@ -112,6 +112,8 @@
+ }
+ 
+ void dm_fps_lock_tick(void) {
++    extern void dm_unity_screen_tick(void);
++    dm_unity_screen_tick();
+     nfs_fps_tick();
+     static int state = -2, rows[NLOCKS], nrow, nlog[NLOCKS], target; static uint8_t *base; static const char *src;
+     if (state == -1) return;
+diff --git a/dm/host/tests/t_unity_screen.c b/dm/host/tests/t_unity_screen.c
+new file mode 100644
+--- /dev/null
++++ b/dm/host/tests/t_unity_screen.c
+@@ -0,0 +1,78 @@
++// Exercise native resize requests, without rendering or shipping game data.
++#include "../hle_unity_screen.c"
++#include <assert.h>
++#include <sys/mman.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++static module_t modules[1];
++module_t *g_mod = modules;
++int g_nmod = 1;
++static int mode, writes;
++int dm_opmode(void) { return mode; }
++void dm_guest_write_prepare(void *p, size_t n) { assert(!((uintptr_t)p & 7) && n == 8); writes++; }
++
++static void run_case(int which) {
++    size_t size = 0x5000000;
++    uint8_t *base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    assert(base != MAP_FAILED);
++    uint64_t object[16] = {0};
++    strcpy(g_mod[0].name, "main");
++    strcpy(g_mod[0].build_id, "94ceae325c205c4b9d6f7235552f28fd");
++    g_mod[0].base = base;
++    *(uintptr_t *)(base + 0x4efe760) = (uintptr_t)object;
++    object[0] = (uintptr_t)base + 0x4aec580;
++    object[1] = UINT64_MAX;   // no pending width/height
++    object[2] = 0x1122334455667788ull;   // fullscreen/refresh fields must survive
++    int *current = (int *)((uint8_t *)object + 0x68);
++    current[0] = 1280; current[1] = 720;
++    setenv("DM_SCREEN_RESOLUTION", "960x540", 1);
++    if (which == 0) setenv("DM_SCREEN_RESOLUTION", "native", 1);
++    if (which == 2) setenv("DM_SCREEN_RESOLUTION", "640x360", 1);
++    if (which == 3) { mode = 1; current[0] = 1920; current[1] = 1080; setenv("DM_SCREEN_RESOLUTION", "1280x720", 1); }
++    if (which == 4) g_mod[0].build_id[0] = '0';
++    if (which == 5) object[0]++;
++    if (which == 6) *(uintptr_t *)(base + 0x4efe760) = 0;
++    if (which == 7) *(uintptr_t *)(base + 0x4efe760) = 0x10000;
++    if (which == 8) current[0] = 0;
++    if (which >= 9 && which <= 12) {
++        const char *bad[] = {"nan", "0.4", "2", "0.75x"};
++        setenv("DM_SCREEN_RESOLUTION", bad[which - 9], 1);
++    }
++    dm_unity_screen_tick();
++    if (which == 0 || which >= 4) {
++        assert(writes == 0 && object[1] == UINT64_MAX);
++    } else {
++        int w = which == 2 ? 640 : which == 3 ? 1280 : 960;
++        int h = which == 2 ? 360 : which == 3 ? 720 : 540;
++        assert(object[1] == ((uint32_t)w | (uint64_t)(uint32_t)h << 32));
++        assert(writes == 1 && object[2] == 0x1122334455667788ull);
++        // Simulate Unity consuming its request. Steady frames must not request
++        // repeated reallocations, even when the game clears the pending pair.
++        current[0] = w; current[1] = h;
++        for (int i = 0; i < 60; i++) dm_unity_screen_tick();
++        assert(writes == 1);
++        object[1] = UINT64_MAX;
++        dm_unity_screen_tick(); assert(writes == 1);
++        // A later native-size request is scaled again, without changing the
++        // fullscreen/refresh fields or progressively multiplying the old size.
++        object[1] = 1280 | (uint64_t)720 << 32;
++        dm_unity_screen_tick(); assert(writes == 2);
++        assert((uint32_t)object[1] == (uint32_t)w);
++        setenv("DM_SCREEN_RESOLUTION", "native", 1);
++        dm_unity_screen_tick();
++        assert((uint32_t)object[1] == (uint32_t)(mode ? 1920 : 1280));
++        assert((uint32_t)(object[1] >> 32) == (uint32_t)(mode ? 1080 : 720));
++    }
++    munmap(base, size);
++}
++
++int main(void) {
++    for (int i = 0; i < 13; i++) {
++        pid_t child = fork(); assert(child >= 0);
++        if (!child) { run_case(i); _exit(0); }
++        int status; assert(waitpid(child, &status, 0) == child);
++        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
++    }
++    puts("Unity screen: native/720p/540p/360p, restore, stable requests, build/vtable gates, invalid and unreadable data passed");
++}
+diff --git a/dm/host/tests/t_fpslock.c b/dm/host/tests/t_fpslock.c
+--- a/dm/host/tests/t_fpslock.c
++++ b/dm/host/tests/t_fpslock.c
+@@ -10,6 +10,7 @@
+ module_t *g_mod = test_modules;
+ int g_nmod;
+ static int writes;
++void dm_unity_screen_tick(void) {}   // exercised separately in t_unity_screen
+ void dm_guest_write_prepare(void *p, size_t n) { (void)p; assert(n == 4); writes++; }
+ 
+ static void check(int which) {
+diff --git a/dm/games/game.py b/dm/games/game.py
+--- a/dm/games/game.py
++++ b/dm/games/game.py
+@@ -97,6 +97,8 @@
+     if pi not in ('game', 'display'): sys.exit(f'{g.id}: present_interval must be game or display: {pi}')
+     ft = g.get('fps_target', '0')   # frame rate cap of the rewriter's frame step (FRAME_STEP in the profile's patches.py: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0) or of the engine's own frame limit (hle_fpslock.c): 0 = the game's own step, 30 / 60
+     if ft not in ('0', '30', '60'): sys.exit(f'{g.id}: fps_target must be 0, 30 or 60: {ft}')
++    sr = g.get('screen_resolution', 'native')
++    if sr not in ('native', '1280x720', '960x540', '640x360'): sys.exit(f'{g.id}: unsupported screen_resolution: {sr}')
+     fh = g.get('fps_hold', 'on')   # whether the frame step may hold a frame longer than the cap's vsyncs when frames come late (hle_nvn.c fstep_tick): on / off
+     if fh not in ('on', 'off'): sys.exit(f'{g.id}: fps_hold must be on or off: {fh}')
+     ps = g.get('present_snap', 'off')   # present snapshots by default (nvn_mtl.m mtl_snap_on; DM_PRESENT_SNAP and the iOS launcher's Frame buffering override it): on / off
+@@ -160,6 +162,7 @@
+          f'#define DM_GAME_CORE_PREEMPT {int(cp == "on")}',
+          f'#define DM_GAME_ALLOC_BIG_ALIGN {int(aba == "on")}',
+          f'#define DM_GAME_FPS_TARGET {int(ft)}',
++         f'#define DM_GAME_SCREEN_RESOLUTION {q(sr)}',
+          f'#define DM_GAME_FPS_HOLD {int(fh == "on")}',
+          f'#define DM_GAME_PRESENT_SNAP {int(ps == "on")}',
+          f'#define DM_GAME_PSO_MTL4 {int(p4 == "on")}',
+diff --git a/dm/games/settings.tsv b/dm/games/settings.tsv
+--- a/dm/games/settings.tsv
++++ b/dm/games/settings.tsv
+@@ -20,6 +20,7 @@
+ DM_FRAMEGEN	choice	off=Off,opticalflow=Optical flow (experimental)	opticalflow	fixups:ARCEUS_TIMING|ZA_TIMING	Game	Frame generation	Generates one intermediate picture per real frame. Uses image optical flow, not the MetalFX frame interpolator. Real target is at most 60 for 120 Hz output; fast HUD motion may show artifacts.	level=basic
+ DM_DYNAMIC_RESOLUTION	toggle	-	0	fixups:DYNAMIC_RESOLUTION	Game	Dynamic resolution	Adjusts resolution between 70% and 100% under load. Turn off to keep full resolution for the selected console mode.
+ DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	fixups:RENDER_SCALE	Game	Render scale		level=basic
++DM_SCREEN_RESOLUTION	choice	native=Original resolution,1280x720=1280 × 720 (720p),960x540=960 × 540 (540p),640x360=640 × 360 (360p)	DM_GAME_SCREEN_RESOLUTION	fixups:UNITY_SCREEN_RESOLUTION	Game	Render resolution	Changes the game view and menus before rendering. Lower resolutions reduce pixel rendering and sharpness. Applies when starting the game.	level=basic
+ DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode		level=basic
+ DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling	Uses more GPU time and can increase heat.
+ DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic
+diff --git a/dm/games/0100000011D90000/game.tsv b/dm/games/0100000011D90000/game.tsv
+--- a/dm/games/0100000011D90000/game.tsv
++++ b/dm/games/0100000011D90000/game.tsv
+@@ -31,11 +31,15 @@
+ # the NPDM declares 16 MB of system resource
+ sys_resource	0x1000000
+ 
+-# ---- Frame rate ----
++# ---- Play mode and frame rate ----
++# The iPhone user confirms stable 30 fps and no actor position jumps in handheld
++# mode. Docked timing remains open; use the verified combination by default.
++op_mode	handheld
+ # Keep the original 30 fps target by default. NVN also paces this choice when
+ # display mode ignores Unity's interval 2; an engine field alone is insufficient.
+ fps_target	30
+ present_interval	display
++screen_resolution	960x540
+ 
+ # ---- Shader split ----
+ shader_groups	/Data/=data
+diff --git a/dm/games/0100000011D90000/patches.py b/dm/games/0100000011D90000/patches.py
+new file mode 100644
+--- /dev/null
++++ b/dm/games/0100000011D90000/patches.py
+@@ -0,0 +1,5 @@
++# Host-side Unity screen requests; no guest code cuts are needed.
++# Native entry points and object layout are verified only for this main build.
++CAPABILITIES = {
++    '94ceae325c205c4b9d6f7235552f28fd': ('UNITY_SCREEN_RESOLUTION',),
++}
+diff --git a/dm/ios/Sources/LauncherSettings.swift b/dm/ios/Sources/LauncherSettings.swift
+--- a/dm/ios/Sources/LauncherSettings.swift
++++ b/dm/ios/Sources/LauncherSettings.swift
+@@ -143,6 +143,9 @@
+         "Dynamic resolution": "动态分辨率",
+         "Adjusts resolution between 70% and 100% under load. Turn off to keep full resolution for the selected console mode.": "根据负载在 70% 至 100% 之间调整分辨率。关闭后使用所选主机模式的完整分辨率。",
+         "Render scale": "内部渲染比例",
++        "Render resolution": "渲染分辨率",
++        "Original resolution": "原始分辨率",
++        "Changes the game view and menus before rendering. Lower resolutions reduce pixel rendering and sharpness. Applies when starting the game.": "调整游戏画面与菜单的渲染分辨率。降低分辨率可减少像素渲染量，清晰度也会降低。启动游戏时生效。",
+         "Console mode": "主机模式",
+         "Docked": "底座模式",
+         "Handheld": "掌机模式",
