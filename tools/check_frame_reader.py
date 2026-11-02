@@ -8,7 +8,7 @@ from observe_game_frame import observe
 folder = Path(sys.argv[1])
 reader = folder / "reader"
 subprocess.run(["clang", "-O2", "-fobjc-arc", str(Path(__file__).with_name("read_game_frame.m")),
-                "-framework", "Foundation", "-framework", "AppKit",
+                "-framework", "Foundation", "-framework", "AppKit", "-framework", "CoreGraphics",
                 "-o", str(reader)], check=True)
 cases = [
     ("power-up-punch-selected.png", "moves", 0),

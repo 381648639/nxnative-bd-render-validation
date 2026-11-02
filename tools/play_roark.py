@@ -27,7 +27,7 @@ BADGE = "\u5fbd\u7ae0"
 def play(root, evidence, process, command, pause, upload, publish_status):
     observer = evidence / "read-game-frame"
     subprocess.run(["clang", "-O2", "-fobjc-arc", str(Path(__file__).with_name("read_game_frame.m")),
-                    "-framework", "Foundation", "-framework", "AppKit",
+                    "-framework", "Foundation", "-framework", "AppKit", "-framework", "CoreGraphics",
                     "-o", str(observer)], check=True)
     frames = evidence / "autoplay"
     frames.mkdir(exist_ok=True)
