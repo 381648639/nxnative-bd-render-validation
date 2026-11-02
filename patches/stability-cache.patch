@@ -252,8 +252,8 @@ new file mode 100644
 +- (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(NSUInteger)options reflection:(id *)reflection error:(NSError **)error {
 +    (void)options; (void)reflection; if (error) *error = nil;
 +    atomic_fetch_add(&lookups, 1);
-+    if (d.binaryArchives.firstObject != expected_read) atomic_fetch_add(&wrong_lookup, 1);
-+    return [NSObject new];
++    if (expected_read && d.binaryArchives.firstObject != expected_read) atomic_fetch_add(&wrong_lookup, 1);
++    return expected_read && d.binaryArchives.firstObject == expected_read ? [NSObject new] : nil;
 +}
 +- (id)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(NSUInteger)options reflection:(id *)reflection error:(NSError **)error {
 +    return [self newRenderPipelineStateWithDescriptor:(id)d options:options reflection:reflection error:error];

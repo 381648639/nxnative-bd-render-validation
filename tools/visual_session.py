@@ -238,6 +238,9 @@ try:
                                            capture_output=True, timeout=30, check=False)
                             if path.exists():
                                 upload(path)
+                        elif 'background' in step:
+                            command('background ' + ('1' if step['background'] else '0'))
+                            pause(step.get('wait', 5))
                         elif step.get('save'):
                             archive = Path(shutil.make_archive(str(evidence / 'live-save'), 'zip', root / 'run/save'))
                             upload(archive)

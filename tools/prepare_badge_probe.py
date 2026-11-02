@@ -26,8 +26,9 @@ for name, old in operations.items():
     text = text.replace(old, 'cache_trace("' + name + ' begin"); ' + old + ' cache_trace("' + name + ' end");')
 for name in ('Render', 'Compute'):
     old = 'if ([archive add' + name + 'PipelineFunctionsWithDescriptor:d error:&add_error])'
-    assert text.count(old) == 1
-    text = text.replace(old, 'cache_trace("' + name.lower() + '-add begin"); BOOL added_ok = [archive add' + name + 'PipelineFunctionsWithDescriptor:d error:&add_error]; cache_trace("' + name.lower() + '-add end");\n        if (added_ok)')
+    if old in text:  # The candidate records on its private writer queue instead.
+        assert text.count(old) == 1
+        text = text.replace(old, 'cache_trace("' + name.lower() + '-add begin"); BOOL added_ok = [archive add' + name + 'PipelineFunctionsWithDescriptor:d error:&add_error]; cache_trace("' + name.lower() + '-add end");\n        if (added_ok)')
 old = 'if (ok) ok = [archive serializeToURL:[NSURL fileURLWithPath:temp] error:&error];'
 assert text.count(old) == 1
 text = text.replace(old, 'if (ok) { cache_trace("serialize begin"); ok = [archive serializeToURL:[NSURL fileURLWithPath:temp] error:&error]; cache_trace("serialize end"); }')
@@ -41,4 +42,20 @@ text = text.replace(old, '''if (getenv("DM_PIPELINE_TRACE")) MLOG("Pipeline begi
     ''' + old + '''
     if (getenv("DM_PIPELINE_TRACE")) MLOG("Pipeline end thread=%p vs=%s fs=%s ok=%d", (void *)pthread_self(), vs->key, fs ? fs->key : "-", ps != nil);''')
 legacy.write_text(text, encoding='utf-8')
+
+# Exercise the existing scripted background sequence at an observed scene. This
+# uses the same guest clock and graphics gate as DM_OE_SCRIPT, without relaunching
+# or changing the game save. It does not emulate UIKit or the iOS watchdog.
+oe = root / 'dm/host/hle_oe.c'
+text = oe.read_text(encoding='utf-8')
+old = 'static void *oe_script(void *arg) {'
+assert text.count(old) == 1
+text = text.replace(old, 'void dm_badge_background(int on) { LOG("badge probe: background=%d begin", on); script_bg(on); LOG("badge probe: background=%d end", on); }\n' + old)
+oe.write_text(text, encoding='utf-8')
+hid = root / 'dm/host/hle_hid.c'
+text = hid.read_text(encoding='utf-8')
+old = '                if (!strncmp(line, "shot ", 5))'
+assert text.count(old) == 1
+text = text.replace(old, '                if (!strncmp(line, "background ", 11)) { void dm_badge_background(int on); dm_badge_background(atoi(line + 11)); continue; }\n' + old)
+hid.write_text(text, encoding='utf-8')
 print('Development-only traditional pipeline operation trace enabled')

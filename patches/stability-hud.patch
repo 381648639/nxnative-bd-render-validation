@@ -1,0 +1,85 @@
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -8,7 +8,6 @@
+ #include <errno.h>
+ #include "front.h"
+ #include "hle.h"
+-#include "hle_unity.h"
+ #include "dm.h"
+ #include "haptics_apple.h"
+ #include "DmAudioRetry.h"
+@@ -151,8 +150,7 @@
+     self.game.frame = CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);
+     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
+         CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
+-        BOOL info = self.fps.numberOfLines > 1;
+-        self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), info ? 230 : (getenv("DM_FRAMEGEN") && !strcmp(getenv("DM_FRAMEGEN"),"opticalflow"))?190:64, info ? 58 : 22);
++        self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), (getenv("DM_FRAMEGEN") && !strcmp(getenv("DM_FRAMEGEN"),"opticalflow"))?190:64, 22);
+     }
+ }
+ - (void)viewDidAppear:(BOOL)a {
+@@ -278,38 +276,21 @@
+ 
+ static UILabel *front_ios_fps_label(void) {
+     const char *e = getenv("DM_SHOW_FPS");
+-    BOOL showFPS = e ? atoi(e) != 0 : [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMShowFPS"] boolValue];
+-    BOOL showSize = getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD")) &&
+-        (strcmp(DM_GAME_SCREEN_RESOLUTION, "native") || getenv("DM_SCREEN_RESOLUTION"));
+-    if (!showFPS && !showSize) return nil;
++    if (!(e ? atoi(e) != 0 : [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMShowFPS"] boolValue])) return nil;
+     UILabel *l = [UILabel new];
+     l.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold]; l.textColor = UIColor.whiteColor; l.textAlignment = NSTextAlignmentCenter;
+-    l.numberOfLines = showSize ? 3 : 1;
+     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45]; l.layer.cornerRadius = 6; l.layer.masksToBounds = YES; l.userInteractionEnabled = NO;
+-    l.text = showFPS ? @"-- fps" : @"";
++    l.text = @"-- fps";
+     __block uint64_t n0 = mtl_present_count(), e0=0,d0=0,r0=0;
+     mtl_framegen_counts(&e0,&d0,&r0); __block double t0 = CACurrentMediaTime();
+     BOOL flow=getenv("DM_FRAMEGEN") && !strcmp(getenv("DM_FRAMEGEN"),"opticalflow");
+-    __block NSString *rate = l.text;
+     [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+         (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime();
+         uint64_t engine,shown,real; mtl_framegen_counts(&engine,&shown,&real);
+         if (now-t0<1.5 && now>t0) {
+-            if(flow) rate=[NSString stringWithFormat:@"渲染 %.0f · 显示 %.0f",(engine-e0)/(now-t0),(shown-d0)/(now-t0)];
+-            else rate = [NSString stringWithFormat:@"%.0f fps", (n - n0) / (now - t0)];
+-        }
+-        NSMutableArray<NSString *> *lines = [NSMutableArray array];
+-        if (showFPS) [lines addObject:rate];
+-        if (showSize) {
+-            int w, h;
+-            // Read the engine's current size, rather than echoing a preset that
+-            // may not have been applied yet. Apple's HUD measures the drawable.
+-            if (dm_unity_screen_size(&w, &h)) [lines addObject:[NSString stringWithFormat:@"渲染 %d × %d", w, h]];
+-            else [lines addObject:@"渲染：加载中"];
+-            CGSize size = g_layer.drawableSize;
+-            [lines addObject:[NSString stringWithFormat:@"输出 %.0f × %.0f", size.width, size.height]];
+-        }
+-        l.text = [lines componentsJoinedByString:@"\n"];
++            if(flow) l.text=[NSString stringWithFormat:@"渲染 %.0f · 显示 %.0f",(engine-e0)/(now-t0),(shown-d0)/(now-t0)];
++            else l.text = [NSString stringWithFormat:@"%.0f fps", (n - n0) / (now - t0)];
++        }
+         e0=engine; d0=shown; r0=real;   // a longer span is the time in the background: no reading
+         n0 = n; t0 = now;
+     }];
+diff --git a/dm/ios/Sources/LauncherSettings.swift b/dm/ios/Sources/LauncherSettings.swift
+--- a/dm/ios/Sources/LauncherSettings.swift
++++ b/dm/ios/Sources/LauncherSettings.swift
+@@ -176,7 +176,6 @@
+         "Balanced": "均衡",
+         "Low": "低",
+         "Keeps shadows enabled with a smaller shadow map. Lower settings soften shadow edges without lowering scene or menu resolution. Applies when starting the game.": "保留阴影，使用较小的阴影贴图。降低后阴影边缘更柔和，场景和菜单分辨率不变；启动游戏时生效。",
+-        "Apple statistics show output size. The game overlay also shows the active internal render size for supported games.": "Apple 面板显示输出尺寸。支持的游戏会同时在游戏信息中显示实际内部渲染尺寸。",
+         "American English": "英语（美国）",
+         "British English": "英语（英国）",
+         "Japanese": "日语",
+diff --git a/dm/games/settings.tsv b/dm/games/settings.tsv
+--- a/dm/games/settings.tsv
++++ b/dm/games/settings.tsv
+@@ -36,4 +36,4 @@
+ DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first start waits a few minutes for it, once.
+ DM_NVN_ENC_THREAD	toggle	-	1|0	gfxapi:nvn	Performance	Encode thread
+ DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	Hold frames when late
+-DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD	Apple statistics show output size. The game overlay also shows the active internal render size for supported games.
++DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD

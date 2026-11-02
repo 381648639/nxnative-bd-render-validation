@@ -2,6 +2,12 @@ name: Reproduce the first gym badge with traditional Metal persistence
 
 on:
   workflow_dispatch:
+    inputs:
+      variant:
+        description: Reproduce the existing host or validate the candidate cache isolation
+        type: choice
+        options: [baseline, candidate]
+        default: baseline
 
 permissions:
   contents: read
@@ -34,6 +40,8 @@ jobs:
         id: runtime
         run: python3 build-config/tools/private_runtime_cache.py restore
       - name: Build the existing host with development operation traces
+        env:
+          VALIDATION_VARIANT: ${{ inputs.variant }}
         shell: bash
         run: |
           set -euo pipefail
@@ -42,6 +50,19 @@ jobs:
             git -C nxnative apply --check "../build-config/patches/$patch.patch"
             git -C nxnative apply "../build-config/patches/$patch.patch"
           done
+          if test "$VALIDATION_VARIANT" = candidate; then
+            for patch in stability-cache stability-hud; do
+              git -C nxnative apply --check "../build-config/patches/$patch.patch"
+              git -C nxnative apply "../build-config/patches/$patch.patch"
+            done
+          fi
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          files = ['dm/gfx/nvn/nvn_pipeline_cache.m', 'dm/host/hle_unity_screen.c', 'dm/host/hle_unity_quality.c', 'dm/ios/Sources/front_ios.m']
+          record = {'variant': os.environ['VALIDATION_VARIANT'], 'production_sha256': {p: hashlib.sha256((Path('nxnative') / p).read_bytes()).hexdigest() for p in files}}
+          Path('game-runtime/stability-sources.json').write_text(json.dumps(record, indent=2) + '\n')
+          PY
           python3 build-config/tools/prepare_visual_host.py nxnative
           python3 build-config/tools/prepare_badge_probe.py nxnative
           python3 build-config/tools/rebuild_visual_host.py nxnative build-config game-runtime nonfinite-probe
@@ -53,6 +74,7 @@ jobs:
           p = Path('game-runtime/runtime.json')
           data = json.loads(p.read_text())
           data['env'].update(DM_FPS_TARGET='30', DM_OPMODE='0', DM_SCREEN_RESOLUTION='960x540', DM_SHADOW_QUALITY='native', DM_NVN_SHOT_OUT='1920x1080', DM_PRESENT_HZ='60', DM_PRESENT_LINK='0', DM_PIPELINE_TRACE='1', DM_PIPELINE_CACHE_DIR=str(Path('game-runtime/run/pipeline-cache').resolve()))
+          data['stability_sources'] = json.loads(Path('game-runtime/stability-sources.json').read_text())
           p.write_text(json.dumps(data, indent=2) + '\n')
           PY
       - name: Restore the first gym leader save unchanged
