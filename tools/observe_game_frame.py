@@ -11,8 +11,11 @@ def observe(reader, path):
     data = json.loads(subprocess.check_output([str(reader), str(path)], timeout=30))
     model = Path(os.environ["BD_OCR_DATA"])
     raw = subprocess.check_output(["tesseract", str(path), "stdout", "--tessdata-dir", str(model),
-                                   "-l", "chi_sim+eng", "--psm", "11", "tsv"],
+                                   "-l", "chi_sim+eng", "--psm", "11", "-c", "tessedit_create_tsv=1"],
                                   stderr=subprocess.DEVNULL, timeout=45).decode()
+    Path(str(path) + ".ocr.tsv").write_text(raw)
+    if not raw.startswith("level\t"):
+        raise ValueError("OCR did not return the requested structured observations")
     groups = {}
     words = []
     for row in csv.DictReader(io.StringIO(raw), delimiter="\t"):
