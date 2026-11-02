@@ -18,7 +18,7 @@ env:
   BD_ASSET_REPOSITORY: wanghao940607-oss/nxnative-pokemon-bd-ios-build
 
 concurrency:
-  group: bd-badge-stability
+  group: bd-badge-stability-${{ inputs.variant }}
   cancel-in-progress: false
 
 jobs:

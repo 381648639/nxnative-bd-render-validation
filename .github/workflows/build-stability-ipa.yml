@@ -1,0 +1,74 @@
+name: Build stability fixes after the first gym badge validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      validation_run:
+        description: Private candidate gameplay run with a completed first-gym badge verdict
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+  GH_TOKEN: ${{ secrets.BD_PRIVATE_REPO_TOKEN }}
+  BD_ASSET_REPOSITORY: wanghao940607-oss/nxnative-pokemon-bd-ios-build
+
+concurrency:
+  group: bd-ios-stability-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: build-config
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: seedds/nxnative
+          ref: 1942eaa5e2a767809868994c27dfc5d692439fdc
+          path: nxnative
+          persist-credentials: false
+      - name: Restore verified private host inputs and passing visual evidence
+        env:
+          VALIDATION_RUN: ${{ inputs.validation_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VALIDATION_RUN" =~ ^[0-9]+$ ]]
+          test "$(gh api "repos/$BD_ASSET_REPOSITORY" --jq .private)" = true
+          mkdir -p private-inputs
+          gh release download bd-resolution-build-inputs-v1 --repo "$BD_ASSET_REPOSITORY" --pattern 'verified-r5-host-inputs.*' --dir private-inputs
+          gh release download "bd-visual-$VALIDATION_RUN" --repo "$BD_ASSET_REPOSITORY" --pattern stability-validation.json --dir private-inputs
+      - name: Apply the inspected graphics controls and unchanged production rendering fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for patch in legacy-renderer legacy-diagnostics legacy-prediction nonfinite-varyings frame-target frame-target-default unity-resolution graphics-controls stability-cache stability-hud; do
+            git -C nxnative apply --check "../build-config/patches/$patch.patch"
+            git -C nxnative apply "../build-config/patches/$patch.patch"
+          done
+          make -C nxnative/dm/host GAME=0100000011D90000 game_profile
+          for name in unity_screen unity_quality; do
+            clang -O1 -g -I nxnative/dm/host/gen/0100000011D90000 "nxnative/dm/host/tests/t_$name.c" -o "/tmp/t_$name"
+            "/tmp/t_$name"
+          done
+          cd nxnative
+          python3 -m unittest dm.tools.tests.test_launcher_settings
+          cd ..
+          command -v xcodegen || brew install xcodegen
+      - name: Rebuild the unsigned iOS host and launcher
+        run: python3 build-config/tools/build_stability_host_delta.py nxnative build-config private-inputs private-inputs/stability-validation.json private-output
+      - name: Keep the rebuilt host only in the private repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="bd-ios-r8-host-$GITHUB_RUN_ID"
+          gh release create "$tag" --repo "$BD_ASSET_REPOSITORY" --title 'Private r8 stability iOS host' --notes 'Unsigned iOS 16 host delta. The verified r5 ROM and shader entries are reused unchanged during local IPA assembly. Mac first-gym badge and traditional cache isolation proof is included; UIKit and device watchdog behavior remain untested.' --prerelease
+          gh release upload "$tag" --repo "$BD_ASSET_REPOSITORY" private-output/r8-host-delta.zip private-output/r8-host-delta.json
