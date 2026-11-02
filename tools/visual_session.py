@@ -229,6 +229,18 @@ try:
                             command('passdump ' + str(min(5, int(step['passdump']))))
                         elif step.get('log'):
                             upload(log)
+                        elif 'sample' in step:
+                            name = step['sample']
+                            if not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}', name):
+                                raise ValueError('Invalid sample name')
+                            path = evidence / (name + '-sample.txt')
+                            subprocess.run(['/usr/bin/sample', str(process.pid), '5', '10', '-file', str(path)],
+                                           capture_output=True, timeout=30, check=False)
+                            if path.exists():
+                                upload(path)
+                        elif step.get('save'):
+                            archive = Path(shutil.make_archive(str(evidence / 'live-save'), 'zip', root / 'run/save'))
+                            upload(archive)
                         elif step.get('diagnostics'):
                             collect(root, evidence)
                             archive = Path(shutil.make_archive(str(evidence.parent / 'live-diagnostics'), 'zip', evidence))

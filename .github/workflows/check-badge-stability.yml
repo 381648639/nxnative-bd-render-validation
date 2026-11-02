@@ -1,0 +1,77 @@
+name: Reproduce the first gym badge with traditional Metal persistence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+  GH_TOKEN: ${{ secrets.BD_PRIVATE_REPO_TOKEN }}
+  BD_ASSET_REPOSITORY: wanghao940607-oss/nxnative-pokemon-bd-ios-build
+
+concurrency:
+  group: bd-badge-stability
+  cancel-in-progress: false
+
+jobs:
+  gameplay:
+    runs-on: xcode-27
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: build-config
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: seedds/nxnative
+          ref: 1942eaa5e2a767809868994c27dfc5d692439fdc
+          path: nxnative
+          persist-credentials: false
+      - name: Restore the verified runtime privately
+        id: runtime
+        run: python3 build-config/tools/private_runtime_cache.py restore
+      - name: Build the existing host with development operation traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          test '${{ steps.runtime.outputs.found }}' = true
+          for patch in legacy-renderer legacy-diagnostics legacy-prediction frame-target frame-target-default unity-resolution graphics-controls; do
+            git -C nxnative apply --check "../build-config/patches/$patch.patch"
+            git -C nxnative apply "../build-config/patches/$patch.patch"
+          done
+          python3 build-config/tools/prepare_visual_host.py nxnative
+          python3 build-config/tools/prepare_badge_probe.py nxnative
+          python3 build-config/tools/rebuild_visual_host.py nxnative build-config game-runtime nonfinite-probe
+          python3 build-config/tools/probe_nonfinite_varyings.py game-runtime
+          python3 build-config/tools/prepare_visual_resources.py nxnative game-runtime
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path('game-runtime/runtime.json')
+          data = json.loads(p.read_text())
+          data['env'].update(DM_FPS_TARGET='30', DM_OPMODE='0', DM_SCREEN_RESOLUTION='960x540', DM_SHADOW_QUALITY='native', DM_NVN_SHOT_OUT='1920x1080', DM_PRESENT_HZ='60', DM_PRESENT_LINK='0', DM_PIPELINE_TRACE='1', DM_PIPELINE_CACHE_DIR=str(Path('game-runtime/run/pipeline-cache').resolve()))
+          p.write_text(json.dumps(data, indent=2) + '\n')
+          PY
+      - name: Restore the first gym leader save unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release download bd-badge-repro-inputs-20261102 --repo "$BD_ASSET_REPOSITORY" --pattern gym-save.zip --output gym-save.zip
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          import zipfile
+          p = Path('gym-save.zip')
+          assert hashlib.sha256(p.read_bytes()).hexdigest() == '2c43aa2342bec215e938a1d8db204d075612ac97ec5bcbbeba4c2ba9eac4539a'
+          with zipfile.ZipFile(p) as z:
+              assert set(z.namelist()) == {'SaveData.bin', 'Backup.bin'}
+              z.extractall('game-runtime/run/save')
+          PY
+      - name: Inspect the leader fight and badge presentation
+        run: python3 build-config/tools/visual_session.py game-runtime visual-evidence --minutes 75
+      - name: Preserve evidence only in private storage
+        if: always()
+        run: python3 build-config/tools/preserve_private_evidence.py
