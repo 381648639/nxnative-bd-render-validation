@@ -1,5 +1,4 @@
 #import <Foundation/Foundation.h>
-#import <Vision/Vision.h>
 #import <AppKit/AppKit.h>
 #include <math.h>
 
@@ -24,24 +23,13 @@ int main(int argc, const char **argv) { @autoreleasepool {
     if (argc != 2) return 2;
     NSURL *url = [NSURL fileURLWithPath:@(argv[1])];
     NSError *error = nil;
-    VNRecognizeTextRequest *request = [VNRecognizeTextRequest new];
-    request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
-    request.recognitionLanguages = @[@"zh-Hans", @"en-US"];
-    request.usesLanguageCorrection = NO;
-    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithURL:url options:@{}];
-    if (![handler performRequests:@[request] error:&error]) {
-        fprintf(stderr, "Frame OCR failed: %s\n", error.localizedDescription.UTF8String);
-        return 1;
-    }
-    NSMutableArray *lines = [NSMutableArray new];
-    for (VNRecognizedTextObservation *observation in request.results) {
-        VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
-        CGRect b = observation.boundingBox;
-        [lines addObject:@{@"text":candidate.string ?: @"", @"x":@(CGRectGetMidX(b)),
-                          @"y":@(1 - CGRectGetMidY(b)), @"confidence":@(candidate.confidence)}];
-    }
     NSBitmapImageRep *bitmap = [NSBitmapImageRep imageRepWithData:[NSData dataWithContentsOfURL:url]];
     if (bitmap.pixelsWide != 1920 || bitmap.pixelsHigh != 1080) return 3;
+    CGImageRef crop = CGImageCreateWithImageInRect(bitmap.CGImage, CGRectMake(28, 975, 210, 42));
+    NSBitmapImageRep *hp = [[NSBitmapImageRep alloc] initWithCGImage:crop];
+    CGImageRelease(crop);
+    [[hp representationUsingType:NSBitmapImageFileTypePNG properties:@{}]
+        writeToURL:[url URLByAppendingPathExtension:@"hp.png"] atomically:YES];
     NSMutableArray *moves = [NSMutableArray new], *party = [NSMutableArray new], *main = [NSMutableArray new];
     for (int i = 0; i < 4; ++i) {
         [moves addObject:@(bracket(bitmap, 1286, 615 + (int)round(i * 116.7)))];
@@ -53,7 +41,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
         [party addObject:@(score)];
     }
     NSData *data = [NSJSONSerialization dataWithJSONObject:
-        @{@"lines":lines, @"moves":moves, @"party":party, @"main":main} options:0 error:&error];
+        @{@"moves":moves, @"party":party, @"main":main} options:0 error:&error];
     if (!data) return 4;
     fwrite(data.bytes, 1, data.length, stdout);
     putchar('\n');

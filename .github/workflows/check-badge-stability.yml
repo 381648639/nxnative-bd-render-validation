@@ -96,11 +96,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          command -v tesseract || brew install tesseract
+          mkdir -p frame-reader-models
+          for language in chi_sim eng; do
+            curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/$language.traineddata" --output "frame-reader-models/$language.traineddata"
+          done
+          echo "BD_OCR_DATA=$PWD/frame-reader-models" >> "$GITHUB_ENV"
           mkdir -p private-reader-fixtures
           for name in power-up-punch-selected.png power-up-punch-selected-02.png chimchar-select.png chimchar-field.png; do
             gh release download bd-visual-41447785856 --repo "$BD_ASSET_REPOSITORY" --pattern "$name" --dir private-reader-fixtures
           done
-          python3 build-config/tools/check_frame_reader.py private-reader-fixtures
+          BD_OCR_DATA="$PWD/frame-reader-models" python3 build-config/tools/check_frame_reader.py private-reader-fixtures
           mkdir -p visual-evidence
           cp private-reader-fixtures/reader-check.json visual-evidence/frame-reader-check.json
       - name: Inspect the leader fight and badge presentation

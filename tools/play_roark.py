@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
+from observe_game_frame import observe as read_frame
 
 FIGHT = "\u6218\u6597"
 RUN = "\u9003\u8d70"
@@ -25,7 +26,7 @@ BADGE = "\u5fbd\u7ae0"
 def play(root, evidence, process, command, pause, upload, publish_status):
     observer = evidence / "read-game-frame"
     subprocess.run(["clang", "-O2", "-fobjc-arc", str(Path(__file__).with_name("read_game_frame.m")),
-                    "-framework", "Foundation", "-framework", "AppKit", "-framework", "Vision",
+                    "-framework", "Foundation", "-framework", "AppKit",
                     "-o", str(observer)], check=True)
     frames = evidence / "autoplay"
     frames.mkdir(exist_ok=True)
@@ -62,7 +63,7 @@ def play(root, evidence, process, command, pause, upload, publish_status):
             time.sleep(.3)
         else:
             raise RuntimeError("No final-present frame completed within the existing capture window")
-        data = json.loads(subprocess.check_output([str(observer), str(path)], timeout=30))
+        data = read_frame(observer, path)
         data["capture"] = path.name
         (path.with_suffix(".json")).write_text(json.dumps(data, indent=2) + "\n")
         return data, path
@@ -82,6 +83,12 @@ def play(root, evidence, process, command, pause, upload, publish_status):
         publish_status()
 
     def fraction(data, left=True):
+        if left:
+            match = re.fullmatch(r"\s*(\d{1,3})\s*/\s*(\d{1,3})\s*", data.get("hp_text", ""))
+            if match:
+                value, maximum = map(int, match.groups())
+                if 0 <= value <= maximum <= 999:
+                    return value, maximum
         lines = [v for v in data["lines"] if (v["x"] < .34 if left else v["x"] > .70)
                  and (v["y"] > .85 if left else v["y"] < .20)]
         for line in lines:
@@ -155,9 +162,11 @@ def play(root, evidence, process, command, pause, upload, publish_status):
             signature = re.sub(r"\d", "", flat)
             same = same + 1 if signature == previous else 0
             previous = signature
-            main = FIGHT in flat and RUN in flat
-            moves = PUNCH in flat and EMBER in flat
-            party_screen = sum(bool(re.search(r"\d+\s*/\s*\d+", v["text"])) for v in lines if v["x"] < .35) >= 3
+            main = max(data["main"]) >= 8
+            moves = max(data["moves"]) >= 8 and not main
+            party_counts = sum(bool(re.search(r"\d+\s*/\s*\d+", v["text"]))
+                               for v in lines if v["x"] < .36)
+            party_screen = max(data["party"]) >= 16 and party_counts >= 2 and not main and not moves
             low_dialog = any(v["x"] > .15 and v["y"] > .72 and
                              len(re.sub(r"[\d\s/]+", "", v["text"])) > 5 for v in lines)
             if BADGE in flat and battle_seen and any(word in flat for word in
