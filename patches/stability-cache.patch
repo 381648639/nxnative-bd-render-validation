@@ -1,0 +1,372 @@
+diff --git a/dm/gfx/nvn/nvn_pipeline_cache.m b/dm/gfx/nvn/nvn_pipeline_cache.m
+--- a/dm/gfx/nvn/nvn_pipeline_cache.m
++++ b/dm/gfx/nvn/nvn_pipeline_cache.m
+@@ -15,11 +15,27 @@
+ #define CACHE_ABI "nvn-ios17-pso-8"
+ #define CACHE_MAX_BYTES (256ull << 20)
+ #define CACHE_RESERVE_BYTES (128ull << 20)
++#define CACHE_PENDING_MAX 256
+ static pthread_mutex_t cache_mu = PTHREAD_MUTEX_INITIALIZER;
+-static id<MTLBinaryArchive> archive;
++// The draw path only reads an immutable archive loaded at startup. Recording and
++// serialization own a separate archive on one utility queue: neither operation
++// may hold a lock needed by a draw or by the foreground/background transition.
++static id<MTLBinaryArchive> archive, read_archive;
+ static NSString *cache_file;
+ static nvn_cache_status stats;
+ static int initialized, save_scheduled;
++static unsigned pending_records;
++static char writer_key;
++static dispatch_queue_t writer_queue(void) {
++    static dispatch_queue_t queue;
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        queue = dispatch_queue_create("org.nxnative.pipeline-cache", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
++        dispatch_queue_set_specific(queue, &writer_key, &writer_key, NULL);
++    });
++    return queue;
++}
++static void cache_write(void);
+ 
+ static NSString *digest(NSData *data) {
+     unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+@@ -76,7 +92,14 @@
+     if (!archive && d.url) {
+         PCLOG("archive rejected; rebuilding safely: %s", error.localizedDescription.UTF8String);
+         d.url = nil; error = nil; archive = [device newBinaryArchiveWithDescriptor:d error:&error];
+-    } else if (archive && d.url) stats.loaded = 1;
++    } else if (archive && d.url) {
++        // Never attach the mutable recording archive to a demanded lookup. In
++        // particular, FailOnBinaryArchiveMiss must not serialize behind a write.
++        NSError *read_error = nil;
++        read_archive = [device newBinaryArchiveWithDescriptor:d error:&read_error];
++        stats.loaded = read_archive != nil;
++        if (!read_archive) PCLOG("read archive unavailable; ordinary compilation retained: %s", read_error.localizedDescription.UTF8String);
++    }
+     if (!archive) { stats.disabled = 1; PCLOG("archive unavailable: %s", error.localizedDescription.UTF8String); }
+     PCLOG("identity=%s loaded=%d disabled=%d", key.UTF8String, stats.loaded, stats.disabled);
+ }
+@@ -91,10 +114,39 @@
+ static void schedule_save_locked(void) {
+     if (save_scheduled || !archive || stats.write_failed) return;
+     save_scheduled = 1;
+-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+-        nvn_cache_flush();
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), writer_queue(), ^{
+         pthread_mutex_lock(&cache_mu); save_scheduled = 0; pthread_mutex_unlock(&cache_mu);
++        cache_write();
+     });
++}
++
++// A successful first-use compile is already usable. Persist its exact descriptor
++// later; retaining a bounded number of copies keeps a slow compiler/serializer
++// from retaining every newly encountered function for the rest of the session.
++static void record_pipeline(MTLRenderPipelineDescriptor *render, MTLComputePipelineDescriptor *compute) {
++    pthread_mutex_lock(&cache_mu);
++    if (!archive || stats.write_failed || pending_records >= CACHE_PENDING_MAX) {
++        stats.bypassed++; pthread_mutex_unlock(&cache_mu); return;
++    }
++    pending_records++;
++    pthread_mutex_unlock(&cache_mu);
++    dispatch_async(writer_queue(), ^{ @autoreleasepool {
++        pthread_mutex_lock(&cache_mu); BOOL enabled = !stats.write_failed; pthread_mutex_unlock(&cache_mu);
++        NSError *error = nil;
++        BOOL ok = enabled && (render ? [archive addRenderPipelineFunctionsWithDescriptor:render error:&error]
++                                     : [archive addComputePipelineFunctionsWithDescriptor:compute error:&error]);
++        pthread_mutex_lock(&cache_mu);
++        pending_records--;
++        if (ok) { stats.added++; schedule_save_locked(); }
++        else {
++            stats.bypassed++;
++            if (enabled) {
++                stats.write_failed = 1;
++                PCLOG("recording failed; previous archive retained: %s", error.localizedDescription.UTF8String);
++            }
++        }
++        pthread_mutex_unlock(&cache_mu);
++    } });
+ }
+ 
+ id<MTLRenderPipelineState> nvn_cached_render(id<MTLDevice> device, MTLRenderPipelineDescriptor *desc, NSError **error) {
+@@ -107,45 +159,47 @@
+         if (@available(iOS 18.0, macOS 15.0, *)) { /* Device serialization supported. */ }
+         else eligible = NO;
+     }
++    id<MTLBinaryArchive> lookup = read_archive;
++    pthread_mutex_unlock(&cache_mu);
+     MTLRenderPipelineDescriptor *d = eligible ? [desc copy] : nil;
+     id<MTLRenderPipelineState> result = nil;
+-    if (eligible) {
+-        d.binaryArchives = @[archive]; NSError *miss = nil;
++    if (eligible && lookup) {
++        d.binaryArchives = @[lookup]; NSError *miss = nil;
+         result = [device newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&miss];
+-        if (result) stats.hits++; else stats.misses++;
+-    } else stats.bypassed++;
++    }
++    pthread_mutex_lock(&cache_mu);
++    if (eligible) { if (result) stats.hits++; else stats.misses++; }
++    else stats.bypassed++;
+     pthread_mutex_unlock(&cache_mu);
+     if (result) { if (error) *error = nil; return result; }
+-    // Ordinary compilation stays outside the archive mutex so prediction retains
+-    // its parallelism. A cache/storage failure never changes the actual descriptor.
++    // Neither ordinary compilation nor archive lookup owns the state mutex.
+     result = [device newRenderPipelineStateWithDescriptor:desc error:error];
+     if (result && eligible) {
+-        pthread_mutex_lock(&cache_mu); NSError *add_error = nil;
+         d.binaryArchives = nil;
+-        if ([archive addRenderPipelineFunctionsWithDescriptor:d error:&add_error]) { stats.added++; schedule_save_locked(); }
+-        else { stats.bypassed++; if (stats.bypassed < 5) PCLOG("render archive fallback: %s", add_error.localizedDescription.UTF8String); }
+-        pthread_mutex_unlock(&cache_mu);
++        record_pipeline(d, nil);
+     }
+     return result;
+ }
+ id<MTLComputePipelineState> nvn_cached_compute(id<MTLDevice> device, id<MTLFunction> function, NSError **error) {
+     pthread_mutex_lock(&cache_mu); cache_init(device);
+     BOOL eligible = archive && can_archive(function);
++    id<MTLBinaryArchive> lookup = read_archive;
++    pthread_mutex_unlock(&cache_mu);
+     MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new]; d.computeFunction = function;
+     id<MTLComputePipelineState> result = nil;
+-    if (eligible) {
+-        d.binaryArchives = @[archive]; NSError *miss = nil;
++    if (eligible && lookup) {
++        d.binaryArchives = @[lookup]; NSError *miss = nil;
+         result = [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&miss];
+-        if (result) stats.hits++; else stats.misses++;
+-    } else stats.bypassed++;
++    }
++    pthread_mutex_lock(&cache_mu);
++    if (eligible) { if (result) stats.hits++; else stats.misses++; }
++    else stats.bypassed++;
+     pthread_mutex_unlock(&cache_mu);
+     if (result) { if (error) *error = nil; return result; }
+     result = [device newComputePipelineStateWithFunction:function error:error];
+     if (result && eligible) {
+-        pthread_mutex_lock(&cache_mu); NSError *add_error = nil; d.binaryArchives = nil;
+-        if ([archive addComputePipelineFunctionsWithDescriptor:d error:&add_error]) { stats.added++; schedule_save_locked(); }
+-        else { stats.bypassed++; if (stats.bypassed < 5) PCLOG("compute archive fallback: %s", add_error.localizedDescription.UTF8String); }
+-        pthread_mutex_unlock(&cache_mu);
++        d.binaryArchives = nil;
++        record_pipeline(nil, d);
+     }
+     return result;
+ }
+@@ -155,10 +209,12 @@
+     if (!pthread_mutex_trylock(&cache_mu)) { last = stats; pthread_mutex_unlock(&cache_mu); }
+     *out = last;
+ }
+-void nvn_cache_flush(void) {
++static void cache_write(void) {
+     @autoreleasepool {
+         pthread_mutex_lock(&cache_mu);
+         if (!archive || stats.added == stats.saved || stats.write_failed) { pthread_mutex_unlock(&cache_mu); return; }
++        uint64_t saving = stats.added;
++        pthread_mutex_unlock(&cache_mu);
+         NSString *dir = cache_file.stringByDeletingLastPathComponent;
+         NSString *temp = [dir stringByAppendingPathComponent:@"pipelines.pending"];
+         struct statvfs space; NSError *error = nil;
+@@ -169,9 +225,9 @@
+         if (ok) { int fd = open(temp.fileSystemRepresentation, O_RDONLY); ok = fd >= 0 && fsync(fd) == 0; if (fd >= 0) close(fd); }
+         if (ok) ok = rename(temp.fileSystemRepresentation, cache_file.fileSystemRepresentation) == 0;
+         if (ok) {
+-            stats.saved = stats.added;
++            pthread_mutex_lock(&cache_mu); stats.saved = saving; nvn_cache_status saved_stats = stats; pthread_mutex_unlock(&cache_mu);
+             int fd = open(dir.fileSystemRepresentation, O_RDONLY); if (fd >= 0) { fsync(fd); close(fd); }
+-            PCLOG("saved added=%llu hits=%llu misses=%llu bypassed=%llu bytes=%llu", stats.saved, stats.hits, stats.misses, stats.bypassed, [attr fileSize]);
++            PCLOG("saved added=%llu hits=%llu misses=%llu bypassed=%llu bytes=%llu", saved_stats.saved, saved_stats.hits, saved_stats.misses, saved_stats.bypassed, [attr fileSize]);
+             // Retain at most the current and most recent previous identity. Only
+             // our fixed archive/temp filenames in hash-named directories qualify.
+             NSString *parent = dir.stringByDeletingLastPathComponent;
+@@ -188,11 +244,17 @@
+                 for (NSString *name in @[@"pipelines.metalarc", @"pipelines.pending"]) [NSFileManager.defaultManager removeItemAtPath:[old[i] stringByAppendingPathComponent:name] error:nil];
+                 rmdir(old[i].fileSystemRepresentation); // Never recursively delete unknown content.
+             }
+-        } else { stats.write_failed = 1; PCLOG("persistence failed; previous archive retained: %s", error ? error.localizedDescription.UTF8String : "space/size/atomic write check"); }
++        } else {
++            pthread_mutex_lock(&cache_mu); stats.write_failed = 1; pthread_mutex_unlock(&cache_mu);
++            PCLOG("persistence failed; previous archive retained: %s", error ? error.localizedDescription.UTF8String : "space/size/atomic write check");
++        }
+         [NSFileManager.defaultManager removeItemAtPath:temp error:nil];
+-        pthread_mutex_unlock(&cache_mu);
+-    }
++    }
++}
++void nvn_cache_flush(void) {
++    if (dispatch_get_specific(&writer_key)) cache_write();
++    else dispatch_sync(writer_queue(), ^{ cache_write(); });
+ }
+ void nvn_cache_flush_async(void) {
+-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ nvn_cache_flush(); });
+-}
++    dispatch_async(writer_queue(), ^{ cache_write(); });
++}
+diff --git a/dm/gfx/tests/t_pipeline_cache.m b/dm/gfx/tests/t_pipeline_cache.m
+new file mode 100644
+--- /dev/null
++++ b/dm/gfx/tests/t_pipeline_cache.m
+@@ -0,0 +1,162 @@
++// Traditional Metal cache: recording/serialization cannot gate demanded PSOs.
++#include "../nvn/nvn_pipeline_cache.m"
++#include <assert.h>
++#include <stdatomic.h>
++
++static _Atomic int checks, failed;
++#define CHECK(name, ok) do { int pass = !!(ok); checks++; failed += !pass; printf("%s: %s\n", name, pass ? "PASS" : "FAIL"); } while (0)
++static dispatch_semaphore_t entered, release_work;
++static _Atomic int block_add, block_write, fail_write;
++static _Atomic int builds, lookups, wrong_lookup;
++static id expected_read;
++
++@interface CacheFunction : NSObject
++@end
++@implementation CacheFunction
++- (NSDictionary *)functionConstantsDictionary { return @{}; }
++@end
++
++@interface CacheArchive : NSObject
++@end
++@implementation CacheArchive
++- (BOOL)addRenderPipelineFunctionsWithDescriptor:(id)d error:(NSError **)error {
++    (void)d; (void)error;
++    if (block_add) { dispatch_semaphore_signal(entered); dispatch_semaphore_wait(release_work, DISPATCH_TIME_FOREVER); }
++    return YES;
++}
++- (BOOL)addComputePipelineFunctionsWithDescriptor:(id)d error:(NSError **)error {
++    return [self addRenderPipelineFunctionsWithDescriptor:d error:error];
++}
++- (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error {
++    if (block_write) { dispatch_semaphore_signal(entered); dispatch_semaphore_wait(release_work, DISPATCH_TIME_FOREVER); }
++    [@"recorded-cache" writeToURL:url atomically:NO encoding:NSUTF8StringEncoding error:nil];
++    if (fail_write && error) *error = [NSError errorWithDomain:@"InjectedArchiveFailure" code:1 userInfo:nil];
++    return !fail_write;
++}
++@end
++
++@interface CacheDevice : NSObject
++@end
++@implementation CacheDevice
++- (id)newRenderPipelineStateWithDescriptor:(id)d error:(NSError **)error {
++    (void)d; if (error) *error = nil; atomic_fetch_add(&builds, 1); return [NSObject new];
++}
++- (id)newComputePipelineStateWithFunction:(id)function error:(NSError **)error {
++    return [self newRenderPipelineStateWithDescriptor:function error:error];
++}
++- (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(NSUInteger)options reflection:(id *)reflection error:(NSError **)error {
++    (void)options; (void)reflection; if (error) *error = nil;
++    atomic_fetch_add(&lookups, 1);
++    if (d.binaryArchives.firstObject != expected_read) atomic_fetch_add(&wrong_lookup, 1);
++    return [NSObject new];
++}
++- (id)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(NSUInteger)options reflection:(id *)reflection error:(NSError **)error {
++    return [self newRenderPipelineStateWithDescriptor:(id)d options:options reflection:reflection error:error];
++}
++@end
++
++static MTLRenderPipelineDescriptor *descriptor(void) {
++    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
++    d.vertexFunction = (id)[CacheFunction new];
++    d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
++    return d;
++}
++static id render(void) { NSError *error = nil; return nvn_cached_render((id)[CacheDevice new], descriptor(), &error); }
++static id compute(void) { NSError *error = nil; return nvn_cached_compute((id)[CacheDevice new], (id)[CacheFunction new], &error); }
++static int signal_within(dispatch_semaphore_t signal, double seconds) {
++    return dispatch_semaphore_wait(signal, dispatch_time(DISPATCH_TIME_NOW, seconds * NSEC_PER_SEC)) == 0;
++}
++static void prepare_mock(NSString *folder) {
++    initialized = 1; archive = (id)[CacheArchive new];
++    cache_file = [folder stringByAppendingPathComponent:@"pipelines.metalarc"];
++    entered = dispatch_semaphore_create(0); release_work = dispatch_semaphore_create(0);
++}
++static void demand_while_blocked(void) {
++    dispatch_semaphore_t done = dispatch_semaphore_create(0);
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
++        CHECK("render returns a valid first-use PSO", render() != nil);
++        CHECK("compute returns a valid first-use PSO", compute() != nil);
++        nvn_cache_status status; nvn_cache_snapshot(&status);
++        dispatch_semaphore_signal(done);
++    });
++    int returned = signal_within(done, 1);
++    CHECK("demands and diagnostics finish while archive work is held", returned);
++    // A second/third add must not block after the first held operation returns.
++    block_add = block_write = 0;
++    dispatch_semaphore_signal(release_work);
++    CHECK("demand task completed", returned || signal_within(done, 2));
++    nvn_cache_flush();
++}
++static void mock_case(const char *mode, NSString *folder) {
++    prepare_mock(folder);
++    if (!strcmp(mode, "add")) {
++        block_add = 1;
++        dispatch_semaphore_t compiled = dispatch_semaphore_create(0);
++        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ render(); dispatch_semaphore_signal(compiled); });
++        CHECK("recording entered", signal_within(entered, 2));
++        CHECK("original demand returns before recording finishes", signal_within(compiled, 1));
++        demand_while_blocked();
++    } else if (!strcmp(mode, "write")) {
++        render(); block_write = 1; nvn_cache_flush_async();
++        CHECK("serializer entered", signal_within(entered, 2));
++        demand_while_blocked();
++    } else if (!strcmp(mode, "failure")) {
++        [@"previous-cache" writeToFile:cache_file atomically:NO encoding:NSUTF8StringEncoding error:nil];
++        render(); fail_write = 1; nvn_cache_flush();
++        CHECK("write failure reported", stats.write_failed);
++        CHECK("previous good file retained", [[NSString stringWithContentsOfFile:cache_file encoding:NSUTF8StringEncoding error:nil] isEqual:@"previous-cache"]);
++        uint64_t added = stats.added;
++        CHECK("render survives failed persistence", render() != nil);
++        CHECK("compute survives failed persistence", compute() != nil);
++        nvn_cache_flush();
++        CHECK("failed writer stops accepting new records", stats.added == added);
++#ifdef CACHE_PENDING_MAX
++    } else if (!strcmp(mode, "lookup")) {
++        expected_read = [CacheArchive new]; read_archive = (id)expected_read;
++        CHECK("render archive hit succeeds", render() != nil);
++        CHECK("compute archive hit succeeds", compute() != nil);
++        CHECK("lookups use the independent immutable archive", atomic_load(&lookups) == 2 && !atomic_load(&wrong_lookup));
++        CHECK("hits do not compile or record", !atomic_load(&builds) && stats.hits == 2 && !pending_records);
++    } else if (!strcmp(mode, "bound")) {
++        block_add = 1; render();
++        CHECK("recording held", signal_within(entered, 2));
++        int all_built = 1;
++        for (unsigned i = 0; i < CACHE_PENDING_MAX + 8; ++i) all_built &= render() != nil;
++        CHECK("flooded demands remain usable", all_built);
++        pthread_mutex_lock(&cache_mu); unsigned pending = pending_records; pthread_mutex_unlock(&cache_mu);
++        CHECK("pending descriptor retention stays bounded", pending == CACHE_PENDING_MAX && stats.bypassed >= 9);
++        block_add = 0; dispatch_semaphore_signal(release_work); nvn_cache_flush();
++#endif
++    } else { fprintf(stderr, "Unknown cache case\n"); exit(2); }
++}
++static void real_case(const char *mode, NSString *folder) {
++    setenv("DM_PIPELINE_CACHE_DIR", folder.fileSystemRepresentation, 1);
++    NSString *shmap = [folder stringByAppendingPathComponent:@"shader_map.tsv"];
++    [@"cache-test\n" writeToFile:shmap atomically:NO encoding:NSUTF8StringEncoding error:nil];
++    setenv("DM_NVN_SHMAP", shmap.fileSystemRepresentation, 1);
++    id<MTLDevice> device = MTLCreateSystemDefaultDevice(); assert(device);
++    NSError *error = nil;
++    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\nvertex float4 vertex_main(uint i [[vertex_id]]) { return float4(float(i),0,0,1); }\nfragment float4 fragment_main() { return float4(1); }\nkernel void compute_main(device uint *p [[buffer(0)]], uint i [[thread_position_in_grid]]) { p[i]=i; }\n";
++    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error]; assert(library);
++    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
++    d.vertexFunction = [library newFunctionWithName:@"vertex_main"];
++    d.fragmentFunction = [library newFunctionWithName:@"fragment_main"];
++    d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
++    CHECK("real render pipeline built", nvn_cached_render(device, d, &error) != nil);
++    CHECK("real compute pipeline built", nvn_cached_compute(device, [library newFunctionWithName:@"compute_main"], &error) != nil);
++    nvn_cache_flush();
++    if (!strcmp(mode, "seed")) CHECK("real archive saved both pipelines", stats.saved == 2 && !stats.write_failed);
++    else {
++        CHECK("compatible archive loaded on a fresh process", stats.loaded);
++        CHECK("both fresh-process pipelines hit the saved archive", stats.hits == 2 && !stats.misses);
++    }
++}
++int main(int argc, char **argv) { @autoreleasepool {
++    alarm(30); setbuf(stdout, NULL); if (argc != 3) return 2;
++    NSString *folder = @(argv[2]);
++    [NSFileManager.defaultManager createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil];
++    if (!strcmp(argv[1], "seed") || !strcmp(argv[1], "replay")) real_case(argv[1], folder);
++    else mock_case(argv[1], folder);
++    printf("traditional pipeline cache: %d checks, %d failed\n", checks, failed);
++    return failed != 0;
++} }
