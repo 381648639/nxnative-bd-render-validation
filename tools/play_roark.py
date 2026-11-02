@@ -78,7 +78,7 @@ def play(root, evidence, process, command, pause, upload, publish_status):
         public_name = evidence / "shots" / ("auto-" + path.name)
         public_name.write_bytes(path.read_bytes())
         upload(public_name)
-        print("Scene driver:", json.dumps(entry), flush=True)
+        print("Scene driver: observation saved privately", flush=True)
         publish_status()
 
     def fraction(data, left=True):
