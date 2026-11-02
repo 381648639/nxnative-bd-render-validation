@@ -5,6 +5,7 @@ advance menus but cannot certify a rendering pass; a person must inspect the
 saved final-present captures and make the separate validation verdict.
 """
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -155,6 +156,17 @@ def play(root, evidence, process, command, pause, upload, publish_status):
                 raise RuntimeError("Game process exited during scene playback")
             if time.monotonic() - began > 180 * 60:
                 raise RuntimeError("Automatic scene playback time budget exhausted")
+            manual = evidence / "autoplay-manual.json"
+            try:
+                request = subprocess.run(
+                    ["gh", "release", "download", "bd-visual-" + os.environ["GITHUB_RUN_ID"],
+                     "--repo", os.environ["BD_ASSET_REPOSITORY"], "--pattern", manual.name,
+                     "--output", str(manual), "--clobber"], capture_output=True, timeout=20)
+                if request.returncode == 0 and json.loads(manual.read_text()) == {"manual": True}:
+                    result.update(verdict="manual control requested", badge_dialog_seen=badge_seen)
+                    break
+            except (subprocess.TimeoutExpired, ValueError):
+                pass
             data, path = observe()
             lines = data["lines"]
             text = "\n".join(v["text"] for v in lines)
