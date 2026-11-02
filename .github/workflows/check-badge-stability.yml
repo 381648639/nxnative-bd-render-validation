@@ -24,7 +24,7 @@ concurrency:
 jobs:
   gameplay:
     runs-on: xcode-27
-    timeout-minutes: 280
+    timeout-minutes: 340
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,8 +92,19 @@ jobs:
               assert set(z.namelist()) == {'SaveData.bin', 'Backup.bin'}
               z.extractall('game-runtime/run/save')
           PY
+      - name: Verify final-frame menu observation against private inspected captures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p private-reader-fixtures
+          for name in power-up-punch-selected.png power-up-punch-selected-02.png chimchar-select.png chimchar-field.png; do
+            gh release download bd-visual-41447785856 --repo "$BD_ASSET_REPOSITORY" --pattern "$name" --dir private-reader-fixtures
+          done
+          python3 build-config/tools/check_frame_reader.py private-reader-fixtures
+          mkdir -p visual-evidence
+          cp private-reader-fixtures/reader-check.json visual-evidence/frame-reader-check.json
       - name: Inspect the leader fight and badge presentation
-        run: python3 build-config/tools/visual_session.py game-runtime visual-evidence --minutes 240
+        run: python3 build-config/tools/visual_session.py game-runtime visual-evidence --minutes 300 --autoplay-roark
       - name: Preserve evidence only in private storage
         if: always()
         run: python3 build-config/tools/preserve_private_evidence.py

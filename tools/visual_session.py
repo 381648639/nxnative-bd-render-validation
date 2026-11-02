@@ -20,6 +20,7 @@ parser.add_argument('runtime', type=Path)
 parser.add_argument('evidence', type=Path)
 parser.add_argument('--minutes', type=int, default=75)
 parser.add_argument('--diagnostics', action='store_true', help='Enable shader and pixel tracing')
+parser.add_argument('--autoplay-roark', action='store_true', help='Drive the supplied leader save with final-frame OCR')
 args = parser.parse_args()
 root, evidence = args.runtime.resolve(), args.evidence.resolve()
 evidence.mkdir(parents=True, exist_ok=True)
@@ -198,6 +199,10 @@ try:
     pause(25)
     capture('boot-025')
     publish_status()
+    if args.autoplay_roark:
+        from play_roark import play
+        play(root, evidence, process, command, pause, upload, publish_status)
+        upload(log)
     last_status = time.monotonic()
     while running and time.monotonic() - began < args.minutes * 60:
         if process.poll() is not None:
@@ -223,7 +228,7 @@ try:
                             pause(float(step.get('hold', 0.2)) + float(step.get('wait', 2)))
                         elif 'shot' in step:
                             capture(step['shot'])
-                        elif 'wait' in step and 'restart' not in step:
+                        elif 'wait' in step and len(step) == 1:
                             pause(step['wait'])
                         elif 'passdump' in step:
                             command('passdump ' + str(min(5, int(step['passdump']))))
