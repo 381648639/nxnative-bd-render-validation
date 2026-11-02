@@ -207,7 +207,7 @@ diff --git a/dm/gfx/tests/t_pipeline_cache.m b/dm/gfx/tests/t_pipeline_cache.m
 new file mode 100644
 --- /dev/null
 +++ b/dm/gfx/tests/t_pipeline_cache.m
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,161 @@
 +// Traditional Metal cache: recording/serialization cannot gate demanded PSOs.
 +#include "../nvn/nvn_pipeline_cache.m"
 +#include <assert.h>
@@ -219,12 +219,7 @@ new file mode 100644
 +static _Atomic int block_add, block_write, fail_write;
 +static _Atomic int builds, lookups, wrong_lookup;
 +static id expected_read;
-+
-+@interface CacheFunction : NSObject
-+@end
-+@implementation CacheFunction
-+- (NSDictionary *)functionConstantsDictionary { return @{}; }
-+@end
++static id<MTLFunction> test_vertex, test_compute;
 +
 +@interface CacheArchive : NSObject
 +@end
@@ -267,16 +262,20 @@ new file mode 100644
 +
 +static MTLRenderPipelineDescriptor *descriptor(void) {
 +    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-+    d.vertexFunction = (id)[CacheFunction new];
++    d.vertexFunction = test_vertex;
 +    d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
 +    return d;
 +}
 +static id render(void) { NSError *error = nil; return nvn_cached_render((id)[CacheDevice new], descriptor(), &error); }
-+static id compute(void) { NSError *error = nil; return nvn_cached_compute((id)[CacheDevice new], (id)[CacheFunction new], &error); }
++static id compute(void) { NSError *error = nil; return nvn_cached_compute((id)[CacheDevice new], test_compute, &error); }
 +static int signal_within(dispatch_semaphore_t signal, double seconds) {
 +    return dispatch_semaphore_wait(signal, dispatch_time(DISPATCH_TIME_NOW, seconds * NSEC_PER_SEC)) == 0;
 +}
 +static void prepare_mock(NSString *folder) {
++    id<MTLLibrary> library = [MTLCreateSystemDefaultDevice() newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nvertex float4 vertex_main(uint i [[vertex_id]]) { return float4(float(i),0,0,1); }\nkernel void compute_main(device uint *p [[buffer(0)]], uint i [[thread_position_in_grid]]) { p[i]=i; }\n" options:nil error:nil];
++    assert(library);
++    test_vertex = [library newFunctionWithName:@"vertex_main"];
++    test_compute = [library newFunctionWithName:@"compute_main"];
 +    initialized = 1; archive = (id)[CacheArchive new];
 +    cache_file = [folder stringByAppendingPathComponent:@"pipelines.metalarc"];
 +    entered = dispatch_semaphore_create(0); release_work = dispatch_semaphore_create(0);
