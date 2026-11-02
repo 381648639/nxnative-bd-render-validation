@@ -24,7 +24,7 @@ concurrency:
 jobs:
   gameplay:
     runs-on: xcode-27
-    timeout-minutes: 100
+    timeout-minutes: 280
     steps:
       - uses: actions/checkout@v4
         with:
@@ -93,7 +93,7 @@ jobs:
               z.extractall('game-runtime/run/save')
           PY
       - name: Inspect the leader fight and badge presentation
-        run: python3 build-config/tools/visual_session.py game-runtime visual-evidence --minutes 75
+        run: python3 build-config/tools/visual_session.py game-runtime visual-evidence --minutes 240
       - name: Preserve evidence only in private storage
         if: always()
         run: python3 build-config/tools/preserve_private_evidence.py
