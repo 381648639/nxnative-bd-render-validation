@@ -1,4 +1,4 @@
-name: Check traditional pipeline cache isolation and restart reuse
+name: Check bounded Metal compiler admission and legacy archive policy
 
 on:
   workflow_dispatch:
@@ -21,36 +21,40 @@ jobs:
           ref: 1942eaa5e2a767809868994c27dfc5d692439fdc
           path: nxnative
           persist-credentials: false
-      - name: Compile the actual traditional cache and controlled archive fixture
+      - name: Apply the same candidate used by gameplay and production builds
         shell: bash
         run: |
           set -euo pipefail
-          git -C nxnative apply --check ../build-config/patches/stability-cache.patch
-          git -C nxnative apply ../build-config/patches/stability-cache.patch
-          make -C nxnative/dm/host GAME=0100000011D90000 game_profile
-          clang -O1 -g -Wall -Wno-incompatible-pointer-types -fobjc-arc -I nxnative/dm/host/gen/0100000011D90000 nxnative/dm/gfx/tests/t_pipeline_cache.m -framework Metal -framework Foundation -o /tmp/t_pipeline_cache
-      - name: Hold archive recording and serialization while demanding real pipeline results
-        shell: bash
-        run: |
-          set -euo pipefail
-          for mode in add write failure lookup bound; do
-            /tmp/t_pipeline_cache "$mode" "$RUNNER_TEMP/cache-$mode"
+          for patch in legacy-renderer legacy-diagnostics legacy-prediction stability-cache compiler-queue; do
+            git -C nxnative apply --check "../build-config/patches/$patch.patch"
+            git -C nxnative apply "../build-config/patches/$patch.patch"
           done
-      - name: Verify real Metal archives survive a fresh process
+          make -C nxnative/dm/host GAME=0100000011D90000 game_profile
+          clang -O1 -g -Wall -Werror -fobjc-arc nxnative/dm/gfx/tests/t_compile_queue.m -framework Metal -framework Foundation -o /tmp/t_compile_queue
+          clang -O1 -g -Wall -Wno-incompatible-pointer-types -Wno-unused-function -fobjc-arc -I nxnative/dm/host/gen/0100000011D90000 nxnative/dm/gfx/tests/t_pipeline_cache.m -framework Metal -framework Foundation -o /tmp/t_pipeline_cache
+      - name: Verify bounded admission, demanded priority and real Metal pipelines
         shell: bash
         run: |
           set -euo pipefail
-          /tmp/t_pipeline_cache seed "$RUNNER_TEMP/cache-restart"
-          /tmp/t_pipeline_cache replay "$RUNNER_TEMP/cache-restart"
-      - name: Prove the same controlled stalls block the original cache
+          MTL_DEBUG_LAYER=1 /tmp/t_compile_queue
+          if /tmp/t_compile_queue baseline; then
+            echo 'Unbounded baseline unexpectedly passed the admission check'
+            exit 1
+          fi
+      - name: Retain archive isolation and fresh-process reuse on supported systems
         shell: bash
         run: |
           set -euo pipefail
-          git -C nxnative show HEAD:dm/gfx/nvn/nvn_pipeline_cache.m > nxnative/dm/gfx/nvn/nvn_pipeline_cache.m
-          clang -O1 -g -Wall -Wno-incompatible-pointer-types -fobjc-arc -I nxnative/dm/host/gen/0100000011D90000 nxnative/dm/gfx/tests/t_pipeline_cache.m -framework Metal -framework Foundation -o /tmp/t_pipeline_cache_old
-          for mode in add write; do
-            if /tmp/t_pipeline_cache_old "$mode" "$RUNNER_TEMP/cache-old-$mode"; then
-              echo "Original cache unexpectedly passed $mode isolation"
-              exit 1
-            fi
+          for mode in add write failure lookup bound seed replay; do
+            folder="$RUNNER_TEMP/cache-$mode"
+            if test "$mode" = replay; then folder="$RUNNER_TEMP/cache-seed"; fi
+            /tmp/t_pipeline_cache "$mode" "$folder"
+          done
+      - name: Cross-compile the production legacy iOS units for 16.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          for source in nvn_pipeline_cache.m nvn_mtl.m; do
+            xcrun --sdk iphoneos clang -target arm64-apple-ios16.1 -isysroot "$sdk" -fobjc-arc -fsyntax-only -Wno-deprecated-declarations -Wno-unused-function -I nxnative/dm/host/gen/0100000011D90000 -I nxnative/dm/gfx/nvn/include "nxnative/dm/gfx/nvn/$source"
           done

@@ -1,0 +1,191 @@
+--- a/dm/gfx/nvn/nvn_pipeline_cache.m
++++ b/dm/gfx/nvn/nvn_pipeline_cache.m
+@@ -9,6 +9,7 @@
+ #include "nvn_pipeline_cache.h"
+ #include "dmsh_chain.h"
+ #include "game_profile.h"
++#include "nvn_compile_queue.h"
+ 
+ #define PCLOG(...) do { fprintf(stderr, "[pipeline-cache] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+ // Bump only when descriptor generation or utility shader semantics change.
+@@ -53,6 +54,12 @@
+ static void cache_init(id<MTLDevice> device) {
+     if (initialized) return;
+     initialized = 1;
++    NSInteger major = NSProcessInfo.processInfo.operatingSystemVersion.majorVersion;
++    if (!nvn_binary_archive_allowed(TARGET_OS_IPHONE, major)) {
++        stats.disabled = 1;
++        PCLOG("binary archives disabled on iOS %ld: legacy compiler safety policy; ordinary pipelines and in-memory reuse retained", (long)major);
++        return;
++    }
+     const char *override = getenv("DM_PIPELINE_CACHE_DIR");
+     if (getenv("DM_PIPELINE_CACHE") && !strcmp(getenv("DM_PIPELINE_CACHE"), "off")) { stats.disabled = 1; return; }
+ #if !TARGET_OS_IPHONE
+--- a/dm/gfx/nvn/nvn_mtl_legacy.inc
++++ b/dm/gfx/nvn/nvn_mtl_legacy.inc
+@@ -4713,8 +4713,9 @@
+ // ---- Parallel precompile: pipelines met for the first time used to be compiled synchronously one by one on the submit thread; 9 misses in a row in one frame = 284 ms (heavy scene on a real device).
+ // Now: on the first pipeline miss in a submission, scan ahead once along the remaining commands (replaying state only, no drawing) and kick all the normal-pass pipelines that will also miss later to the background to compile in parallel;
+ // when the submit thread reaches that draw it only waits for 'the remaining time not yet compiled'. The compiled pipelines are identical to synchronously compiled ones (same descriptor). Pipeline keys of merged passes / specialized fragments depend on the planning result at replay time, are not predicted, and are compiled synchronously as before.
++#include "nvn_compile_queue.h"
+ #define PSO_PEND_MAX 384
+-static struct { pso_key k; id<MTLRenderPipelineState> ps; int used, done; } g_pp[PSO_PEND_MAX];
++static struct { pso_key k; id<MTLRenderPipelineState> ps; NSBlockOperation *work; int used, done; } g_pp[PSO_PEND_MAX];
+ static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pp_cv = PTHREAD_COND_INITIALIZER;
+ static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
+ static void pso_predict_rest(void);
+@@ -4738,15 +4739,30 @@
+     pthread_mutex_unlock(&g_pp_mu);
+     if (at >= 0 || slot < 0) return;
+     pso_key pk = *k; g_pp_kicked++;
+-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
++    NSBlockOperation *work = [NSBlockOperation blockOperationWithBlock:^{ @autoreleasepool {
+         NSError *e = nil; id<MTLRenderPipelineState> ps = pso_build(&pk, vs, fs, nil, 0, vs->specialized || (fs && fs->specialized), &e);
+-        pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
+-    });
++        pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].work = nil; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
++    } }];
++    pthread_mutex_lock(&g_pp_mu); g_pp[slot].work = work; pthread_mutex_unlock(&g_pp_mu);
++    [nvn_compile_queue() addOperation:work];
+ }
+ static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // Called by the submit thread: if it is in the table, wait for it to finish compiling and take it; otherwise return nil
+     pthread_mutex_lock(&g_pp_mu);
+     int at = pso_pend_find(k); id<MTLRenderPipelineState> ps = nil;
+-    if (at >= 0) { while (!g_pp[at].done) pthread_cond_wait(&g_pp_cv, &g_pp_mu); ps = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].used = 0; }
++    if (at >= 0) {
++        // Prioritize the actual draw over guesses for later passes. Queued work
++        // has not occupied a compiler thread or an Objective-C monitor yet.
++        g_pp[at].work.queuePriority = NSOperationQueuePriorityVeryHigh;
++        unsigned waits = 0;
++        while (!g_pp[at].done) {
++            struct timespec until; clock_gettime(CLOCK_REALTIME, &until); until.tv_sec += 5;
++            int status = pthread_cond_timedwait(&g_pp_cv, &g_pp_mu, &until);
++            if (status == ETIMEDOUT && !g_pp[at].done && waits++ < 3)
++                MLOG("Pipeline compiler still pending: slot=%d wait_at_least=%us vertex=%s fragment=%s", at, waits * 5,
++                     ((__bridge NvShader *)k->vs)->key, k->fs ? ((__bridge NvShader *)k->fs)->key : "-");
++        }
++        ps = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].work = nil; g_pp[at].used = 0;
++    }
+     pthread_mutex_unlock(&g_pp_mu);
+     return ps;
+ }
+--- /dev/null
++++ b/dm/gfx/nvn/nvn_compile_queue.h
+@@ -0,0 +1,35 @@
++#ifndef NVN_COMPILE_QUEUE_H
++#define NVN_COMPILE_QUEUE_H
++
++#import <Foundation/Foundation.h>
++#include <stdio.h>
++
++// A global concurrent queue does not bound synchronous Metal compiler clients.
++// Waiting clients can exhaust its worker pool while the compiler needs workers
++// from that same pool. Admission must happen before executing the client block,
++// not with a semaphore that parks another global worker for every prediction.
++enum { NVN_COMPILE_CONCURRENCY = 2 };
++static NSOperationQueue *nvn_compile_queue(void) {
++    static NSOperationQueue *queue;
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        queue = [NSOperationQueue new];
++        queue.name = @"org.nxnative.pipeline-compile";
++        queue.qualityOfService = NSQualityOfServiceUserInitiated;
++        queue.maxConcurrentOperationCount = NVN_COMPILE_CONCURRENCY;
++        fprintf(stderr, "[pipeline-compile] speculative compiler clients limited to %d; demanded work has priority\n", NVN_COMPILE_CONCURRENCY);
++    });
++    return queue;
++}
++
++// A15 / iOS 16 reported an internal compiler error while serializing an archive
++// and stopped producing frames. Moving serialization off our mutex cannot
++// isolate Apple's shared compiler service. Keep the legacy iOS path free of
++// optional binary-archive work; ordinary pipeline and in-memory PSO caches stay
++// available. This is a conservative driver fallback, not proof of the hang's
++// complete cause. Newer systems retain the existing persistence path.
++static int nvn_binary_archive_allowed(int is_ios, NSInteger major_version) {
++    return !is_ios || major_version >= 18;
++}
++
++#endif
+--- /dev/null
++++ b/dm/gfx/tests/t_compile_queue.m
+@@ -0,0 +1,79 @@
++// Exercise actual admission and demanded-work priority with blocked compiler
++// clients, then compile real pipelines through the same scheduler.
++#include "../nvn/nvn_compile_queue.h"
++#import <Metal/Metal.h>
++#include <stdatomic.h>
++#include <string.h>
++#include <unistd.h>
++
++static _Atomic int active, peak, started, failed, checks;
++static dispatch_semaphore_t entered, release_client, finished;
++static int order[32];
++#define CHECK(name, condition) do { int ok = !!(condition); checks++; failed += !ok; printf("%s: %s\n", name, ok ? "PASS" : "FAIL"); } while (0)
++static int wait_for(dispatch_semaphore_t sem, double seconds) {
++    return !dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)));
++}
++static void client(int index) {
++    int n = atomic_fetch_add(&active, 1) + 1;
++    int old = peak;
++    while (n > old && !atomic_compare_exchange_weak(&peak, &old, n)) {}
++    int pos = atomic_fetch_add(&started, 1);
++    order[pos] = index;
++    dispatch_semaphore_signal(entered);
++    dispatch_semaphore_wait(release_client, DISPATCH_TIME_FOREVER);
++    atomic_fetch_sub(&active, 1);
++    dispatch_semaphore_signal(finished);
++}
++int main(int argc, char **argv) { @autoreleasepool {
++    alarm(30); setbuf(stdout, NULL);
++    int baseline = argc > 1 && !strcmp(argv[1], "baseline");
++    entered = dispatch_semaphore_create(0);
++    release_client = dispatch_semaphore_create(0);
++    finished = dispatch_semaphore_create(0);
++    CHECK("iOS 16 optional archive work is excluded", !nvn_binary_archive_allowed(1, 16));
++    CHECK("iOS 17 uses the conservative legacy policy", !nvn_binary_archive_allowed(1, 17));
++    CHECK("iOS 18 keeps the newer archive path", nvn_binary_archive_allowed(1, 18));
++    CHECK("Mac archive testing remains enabled", nvn_binary_archive_allowed(0, 14));
++    enum { count = 24 };
++    NSMutableArray<NSBlockOperation *> *jobs = [NSMutableArray array];
++    for (int i = 0; i < count; i++) {
++        NSBlockOperation *job = [NSBlockOperation blockOperationWithBlock:^{ client(i); }];
++        [jobs addObject:job];
++    }
++    if (baseline) {
++        for (int i = 0; i < count; i++) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ client(i); });
++    } else {
++        for (NSBlockOperation *job in jobs) [nvn_compile_queue() addOperation:job];
++    }
++    CHECK("first compiler client starts", wait_for(entered, 3));
++    CHECK("second compiler client starts", wait_for(entered, 3));
++    int third = wait_for(entered, 0.3);
++    CHECK("speculative compiler admission is bounded before execution", !third && peak == NVN_COMPILE_CONCURRENCY);
++    if (!baseline) {
++        jobs.lastObject.queuePriority = NSOperationQueuePriorityVeryHigh;
++        dispatch_semaphore_signal(release_client);
++        CHECK("demanded queued client starts after a slot is released", wait_for(entered, 3));
++        CHECK("actual draw is promoted ahead of remaining guesses", order[2] == count - 1);
++    }
++    for (int i = 0; i < count; i++) dispatch_semaphore_signal(release_client);
++    for (int i = 0; i < count; i++) CHECK("compiler job completes", wait_for(finished, 3));
++    if (!baseline) {
++        [nvn_compile_queue() waitUntilAllOperationsAreFinished];
++        CHECK("all pending clients finish with no slot leaks", active == 0 && started == count && peak == NVN_COMPILE_CONCURRENCY);
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        NSError *error = nil;
++        id<MTLLibrary> lib = [device newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nvertex float4 v(uint i [[vertex_id]]) { return float4(i & 1, i >> 1, 0, 1); }\nfragment float4 f() { return float4(1); }\n" options:nil error:&error];
++        CHECK("real test Metal source compiles", lib != nil);
++        for (int i = 0; i < 12; i++) [nvn_compile_queue() addOperationWithBlock:^{ @autoreleasepool {
++            MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
++            d.vertexFunction = [lib newFunctionWithName:@"v"];
++            d.fragmentFunction = [lib newFunctionWithName:@"f"];
++            d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
++            NSError *e = nil;
++            CHECK("queued real render pipeline remains valid", [device newRenderPipelineStateWithDescriptor:d error:&e] != nil);
++        } }];
++        [nvn_compile_queue() waitUntilAllOperationsAreFinished];
++    }
++    printf("compile scheduler: %d checks, %d failed; peak clients %d\n", checks, failed, peak);
++    return failed != 0;
++} }

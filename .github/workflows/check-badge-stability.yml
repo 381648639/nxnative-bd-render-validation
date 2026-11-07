@@ -90,6 +90,7 @@ jobs:
           import zipfile
           p = Path('freeze-inputs.zip')
           assert hashlib.sha256(p.read_bytes()).hexdigest() == 'c37f294395d9b31e48b72572f6241f836c63161439364b15416b757298769e49'
+          Path('game-runtime/run/save').mkdir(parents=True, exist_ok=True)
           with zipfile.ZipFile(p) as z:
               for name in ('SaveData.bin', 'Backup.bin'):
                   (Path('game-runtime/run/save') / name).write_bytes(z.read(name))
