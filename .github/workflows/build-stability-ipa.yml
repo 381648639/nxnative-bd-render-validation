@@ -1,10 +1,10 @@
-name: Build stability fixes after the first gym badge validation
+name: Build the validated legacy compiler freeze candidate
 
 on:
   workflow_dispatch:
     inputs:
       validation_run:
-        description: Private candidate gameplay run with a completed first-gym badge verdict
+        description: Private new-save gameplay run with an inspected freeze-validation verdict
         required: true
         type: string
 
@@ -17,7 +17,7 @@ env:
   BD_ASSET_REPOSITORY: wanghao940607-oss/nxnative-pokemon-bd-ios-build
 
 concurrency:
-  group: bd-ios-stability-build
+  group: bd-ios-freeze-build
   cancel-in-progress: false
 
 jobs:
@@ -35,7 +35,7 @@ jobs:
           ref: 1942eaa5e2a767809868994c27dfc5d692439fdc
           path: nxnative
           persist-credentials: false
-      - name: Restore verified private host inputs and passing visual evidence
+      - name: Restore private host inputs and inspected new-save evidence
         env:
           VALIDATION_RUN: ${{ inputs.validation_run }}
         shell: bash
@@ -45,12 +45,12 @@ jobs:
           test "$(gh api "repos/$BD_ASSET_REPOSITORY" --jq .private)" = true
           mkdir -p private-inputs
           gh release download bd-resolution-build-inputs-v1 --repo "$BD_ASSET_REPOSITORY" --pattern 'verified-r5-host-inputs.*' --dir private-inputs
-          gh release download "bd-visual-$VALIDATION_RUN" --repo "$BD_ASSET_REPOSITORY" --pattern stability-validation.json --dir private-inputs
-      - name: Apply the inspected graphics controls and unchanged production rendering fixes
+          gh release download "bd-visual-$VALIDATION_RUN" --repo "$BD_ASSET_REPOSITORY" --pattern freeze-validation.json --dir private-inputs
+      - name: Apply the same bounded compiler and legacy archive policy
         shell: bash
         run: |
           set -euo pipefail
-          for patch in legacy-renderer legacy-diagnostics legacy-prediction nonfinite-varyings frame-target frame-target-default unity-resolution graphics-controls stability-cache stability-hud; do
+          for patch in legacy-renderer legacy-diagnostics legacy-prediction nonfinite-varyings frame-target frame-target-default unity-resolution graphics-controls stability-cache stability-hud compiler-queue; do
             git -C nxnative apply --check "../build-config/patches/$patch.patch"
             git -C nxnative apply "../build-config/patches/$patch.patch"
           done
@@ -63,12 +63,12 @@ jobs:
           python3 -m unittest dm.tools.tests.test_launcher_settings
           cd ..
           command -v xcodegen || brew install xcodegen
-      - name: Rebuild the unsigned iOS host and launcher
-        run: python3 build-config/tools/build_stability_host_delta.py nxnative build-config private-inputs private-inputs/stability-validation.json private-output
-      - name: Keep the rebuilt host only in the private repository
+      - name: Build and inspect the unsigned iOS 16.1 host
+        run: python3 build-config/tools/build_freeze_host_delta.py nxnative build-config private-inputs private-inputs/freeze-validation.json private-output
+      - name: Preserve the host delta only in private storage
         shell: bash
         run: |
           set -euo pipefail
-          tag="bd-ios-r8-host-$GITHUB_RUN_ID"
-          gh release create "$tag" --repo "$BD_ASSET_REPOSITORY" --title 'Private r8 stability iOS host' --notes 'Unsigned iOS 16 host delta. The verified r5 ROM and shader entries are reused unchanged during local IPA assembly. Mac first-gym badge and traditional cache isolation proof is included; UIKit and device watchdog behavior remain untested.' --prerelease
-          gh release upload "$tag" --repo "$BD_ASSET_REPOSITORY" private-output/r8-host-delta.zip private-output/r8-host-delta.json
+          tag="bd-ios-r9-host-$GITHUB_RUN_ID"
+          gh release create "$tag" --repo "$BD_ASSET_REPOSITORY" --title 'Private r9 legacy compiler candidate' --notes 'Unsigned iOS 16.1 host delta; game resources and shader chain unchanged. New-save Mac evidence is included. Device recovery remains unverified.' --prerelease
+          gh release upload "$tag" --repo "$BD_ASSET_REPOSITORY" private-output/r9-host-delta.zip private-output/r9-host-delta.json
